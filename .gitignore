@@ -1,0 +1,17 @@
+# Build output
+dist/
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+
+# Source assets (processed versions are tracked)
+sun.png
