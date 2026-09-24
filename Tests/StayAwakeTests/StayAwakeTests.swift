@@ -67,6 +67,7 @@ final class ConfigTests: XCTestCase {
         let decoded = try decode("{}")
         XCTAssertEqual(decoded.mode, .on)
         XCTAssertTrue(decoded.preventScreenLock)
+        XCTAssertTrue(decoded.malformedKeys.isEmpty, "an absent key is not a malformed key")
     }
 
     func testLegacyAutoConfigLoadsAsOn() throws {
@@ -86,21 +87,44 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(Set(json.keys), ["mode", "preventScreenLock"])
     }
 
-    func testWrongTypeFallsBackToDefault() throws {
+    func testWrongTypedPreventScreenLockFallsBackToSafeValue() throws {
         let decoded = try decode(#"{"preventScreenLock": "yes"}"#)
-        XCTAssertTrue(decoded.preventScreenLock)
+        XCTAssertFalse(decoded.preventScreenLock, "a value we could not read must not turn screen-lock prevention on")
+        XCTAssertEqual(decoded.mode, .on, "an absent key still uses the default")
+        XCTAssertEqual(decoded.malformedKeys, ["preventScreenLock"])
     }
 
     func testMalformedKeyDoesNotDiscardTheRest() throws {
         let decoded = try decode(#"{"mode": "off", "preventScreenLock": "yes"}"#)
         XCTAssertEqual(decoded.mode, .off)
-        XCTAssertTrue(decoded.preventScreenLock)
+        XCTAssertFalse(decoded.preventScreenLock)
+        XCTAssertEqual(decoded.malformedKeys, ["preventScreenLock"])
     }
 
-    func testMalformedModeDoesNotDiscardTheRest() throws {
+    func testMalformedModeFallsBackToSafeValueAndKeepsTheRest() throws {
         let decoded = try decode(#"{"mode": 5, "preventScreenLock": false}"#)
-        XCTAssertEqual(decoded.mode, StayAwakeConfig.default.mode)
+        XCTAssertEqual(decoded.mode, .off, "a mode we could not read must not force the Mac awake")
         XCTAssertFalse(decoded.preventScreenLock)
+        XCTAssertEqual(decoded.malformedKeys, ["mode"])
+    }
+
+    func testNullModeFallsBackToSafeValue() throws {
+        let decoded = try decode(#"{"mode": null, "preventScreenLock": false}"#)
+        XCTAssertEqual(decoded.mode, .off)
+        XCTAssertEqual(decoded.malformedKeys, ["mode"])
+    }
+
+    func testEveryMalformedKeyIsReported() throws {
+        let decoded = try decode(#"{"mode": 5, "preventScreenLock": "yes"}"#)
+        XCTAssertEqual(decoded.mode, .off)
+        XCTAssertFalse(decoded.preventScreenLock)
+        XCTAssertEqual(decoded.malformedKeys, ["mode", "preventScreenLock"])
+    }
+
+    func testMalformedKeysAreNotEncoded() throws {
+        let decoded = try decode(#"{"mode": 5}"#)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any])
+        XCTAssertEqual(Set(json.keys), ["mode", "preventScreenLock"])
     }
 }
 
@@ -168,6 +192,69 @@ final class LoadConfigTests: XCTestCase {
         let result = loadConfig(path: path)
         XCTAssertEqual(result.config.mode, .off)
         XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testWrongTypedModeFallsBackToSafeStateAndReportsWhy() throws {
+        try write(#"{"mode": 5, "preventScreenLock": false}"#)
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off, "a value we could not read must not mean \"force the Mac awake\"")
+        XCTAssertNotNil(result.rejectionReason, "a key we could not read must reach the launch alert")
+    }
+
+    func testWrongTypedPreventScreenLockReportsWhyAndKeepsTheReadableKey() throws {
+        try write(#"{"mode": "on", "preventScreenLock": "yes"}"#)
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .on, "a readable key survives a malformed sibling")
+        XCTAssertFalse(result.config.preventScreenLock)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testRejectionReasonNamesTheMalformedKeys() throws {
+        try write(#"{"mode": 5, "preventScreenLock": "yes"}"#)
+        let reason = try XCTUnwrap(loadConfig(path: path).rejectionReason)
+        XCTAssertTrue(reason.contains("mode"))
+        XCTAssertTrue(reason.contains("preventScreenLock"))
+    }
+}
+
+// MARK: - Save Config
+
+final class SaveConfigTests: XCTestCase {
+    private var path = ""
+
+    override func setUp() {
+        super.setUp()
+        path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(atPath: path)
+        super.tearDown()
+    }
+
+    func testWritesRegularFileAndReportsSuccess() throws {
+        XCTAssertTrue(saveConfig(StayAwakeConfig(mode: .off, preventScreenLock: false), path: path))
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertFalse(result.config.preventScreenLock)
+        let perms = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(perms.int16Value, 0o600)
+    }
+
+    func testRefusesSymlinkAndReportsFailure() throws {
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try #"{"mode": "on"}"#.write(to: target, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: target.path)
+        defer { try? FileManager.default.removeItem(at: target) }
+
+        XCTAssertFalse(saveConfig(StayAwakeConfig(mode: .off, preventScreenLock: false), path: path),
+                       "a save that never wrote must not report success")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), #"{"mode": "on"}"#)
+    }
+
+    func testRefusesDirectoryAndReportsFailure() throws {
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        XCTAssertFalse(saveConfig(.default, path: path))
     }
 }
 

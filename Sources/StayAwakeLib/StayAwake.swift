@@ -6,6 +6,7 @@ import UserNotifications
 let PMSET = "/usr/bin/pmset"
 let CONFIG_PATH = NSString("~/.stayawake.json").expandingTildeInPath
 let MAX_CONFIG_SIZE: UInt64 = 1_048_576
+let CLEANUP_FAILURE_REMEDY = "The Mac is still set not to sleep. Run `sudo pmset -a disablesleep 0` in Terminal, or launch StayAwake again to restore it."
 
 var appVersion: String {
     Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -32,6 +33,13 @@ enum Mode: String, Codable {
 struct StayAwakeConfig: Codable {
     var mode: Mode = .on
     var preventScreenLock = true
+    /// Keys that were present but unreadable, so their value came from ``safeFallback`` rather than the file.
+    /// Never encoded — it describes one decode, not the user's settings.
+    var malformedKeys: [String] = []
+
+    enum CodingKeys: String, CodingKey {
+        case mode, preventScreenLock
+    }
 
     static let `default` = StayAwakeConfig()
 
@@ -41,14 +49,35 @@ struct StayAwakeConfig: Codable {
 }
 
 extension StayAwakeConfig {
-    /// Each key decodes independently so config files written by older versions keep loading and one malformed
-    /// value falls back to its own default instead of discarding every other key in the file.
+    /// Each key decodes independently so config files written by older versions keep loading and one unreadable
+    /// value does not discard every other key in the file.
+    ///
+    /// Absence and unreadability are not the same thing. A key the file never mentions takes ``default``; a key that
+    /// is there but cannot be read takes ``safeFallback`` and is named in ``malformedKeys``, because a value the app
+    /// could not read must never be the reason it forces the Mac awake.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let decodedMode = try? container.decodeIfPresent(Mode.self, forKey: .mode)
-        let decodedPreventScreenLock = try? container.decodeIfPresent(Bool.self, forKey: .preventScreenLock)
-        mode = decodedMode.flatMap { $0 } ?? Self.default.mode
-        preventScreenLock = decodedPreventScreenLock.flatMap { $0 } ?? Self.default.preventScreenLock
+        var malformed: [String] = []
+
+        if !container.contains(.mode) {
+            mode = Self.default.mode
+        } else if let decoded = try? container.decode(Mode.self, forKey: .mode) {
+            mode = decoded
+        } else {
+            mode = Self.safeFallback.mode
+            malformed.append(CodingKeys.mode.stringValue)
+        }
+
+        if !container.contains(.preventScreenLock) {
+            preventScreenLock = Self.default.preventScreenLock
+        } else if let decoded = try? container.decode(Bool.self, forKey: .preventScreenLock) {
+            preventScreenLock = decoded
+        } else {
+            preventScreenLock = Self.safeFallback.preventScreenLock
+            malformed.append(CodingKeys.preventScreenLock.stringValue)
+        }
+
+        malformedKeys = malformed
     }
 }
 
@@ -77,26 +106,34 @@ func loadConfig(path: String = CONFIG_PATH) -> (config: StayAwakeConfig, rejecti
         return (.safeFallback, "\(path) could not be read")
     }
     do {
-        return (try JSONDecoder().decode(StayAwakeConfig.self, from: data), nil)
+        let config = try JSONDecoder().decode(StayAwakeConfig.self, from: data)
+        guard config.malformedKeys.isEmpty else {
+            return (config, "\(path) has unreadable values for: \(config.malformedKeys.joined(separator: ", "))")
+        }
+        return (config, nil)
     } catch {
         return (.safeFallback, "\(path) is not valid StayAwake JSON: \(error.localizedDescription)")
     }
 }
 
-func saveConfig(_ config: StayAwakeConfig) {
+/// - Returns: whether the settings reached disk. A `false` return means the change is live but will not survive a
+///   restart, which only an alert can tell the user — this app is an LSUIElement, so stderr reaches nobody.
+func saveConfig(_ config: StayAwakeConfig, path: String = CONFIG_PATH) -> Bool {
     var statBuf = stat()
-    if lstat(CONFIG_PATH, &statBuf) == 0 {
-        guard (statBuf.st_mode & S_IFMT) == S_IFREG else { return }
+    if lstat(path, &statBuf) == 0 {
+        guard (statBuf.st_mode & S_IFMT) == S_IFREG else { return false }
     }
 
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    guard let data = try? encoder.encode(config) else { return }
+    guard let data = try? encoder.encode(config) else { return false }
     do {
-        try data.write(to: URL(fileURLWithPath: CONFIG_PATH), options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: CONFIG_PATH)
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        return true
     } catch {
         fputs("Warning: could not save config\n", stderr)
+        return false
     }
 }
 
@@ -285,10 +322,13 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupMenu()
 
         if let reason = load.rejectionReason {
-            showFailureAlert(
-                "StayAwake could not read its settings",
-                "\(reason)\n\nStarting with Keep Awake off. Changing a setting from the menu rewrites the file."
-            )
+            // `saveConfig` refuses the same paths `isPathSafeToAccess` rejects, so telling that user to change a
+            // setting from the menu would promise a write that provably will not happen.
+            let remedy = isPathSafeToAccess(CONFIG_PATH)
+                ? "Changing a setting from the menu rewrites the file."
+                : "StayAwake will not write through a symlink or directory — move or delete \(CONFIG_PATH) to use the menu's settings."
+            let state = config.mode == .on ? "Keep Awake stays on." : "Starting with Keep Awake off."
+            showFailureAlert("StayAwake could not read its settings", "\(reason)\n\n\(state) \(remedy)")
         }
 
         if !checkSudoers() {
@@ -299,7 +339,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler { [weak self] in
-                self?.cleanup()
+                if self?.cleanup() == false { self?.reportCleanupFailure() }
                 exit(0)
             }
             source.resume()
@@ -310,7 +350,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
-        cleanup()
+        if !cleanup() { reportCleanupFailure() }
     }
 
     // MARK: Icons
@@ -381,23 +421,35 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateMenuState() {
-        keepAwakeItem.state = config.mode == .on ? .on : .off
+        // `wantsAwake`, not `config.mode`: the config is the user's persisted intent, while the menu has to be able
+        // to show that a change pmset refused did not take. `rollBackFailedSleepChange` returns this to reality.
+        keepAwakeItem.state = wantsAwake ? .on : .off
         preventLockItem.state = config.preventScreenLock ? .on : .off
         launchAtLoginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
     @objc private func onToggleKeepAwake() {
-        config.mode = config.mode == .on ? .off : .on
-        saveConfig(config)
-        updateMenuState()
-        requestAwake(config.mode == .on)
+        // Toggles against the displayed state, not `config.mode`: after a failed change the two disagree, and a
+        // click must then retry what the menu shows as off rather than flip the stored preference to match it.
+        let wanted = !wantsAwake
+        config.mode = wanted ? .on : .off
+        persistConfig()
+        requestAwake(wanted)
     }
 
     @objc private func onTogglePreventScreenLock() {
         config.preventScreenLock.toggle()
-        saveConfig(config)
+        persistConfig()
         updateMenuState()
         updateDisplayAssertion()
+    }
+
+    private func persistConfig() {
+        guard !saveConfig(config) else { return }
+        showFailureAlert(
+            "StayAwake could not save its settings",
+            "\(CONFIG_PATH) could not be written. The change applies now but will not survive a restart."
+        )
     }
 
     @objc private func onToggleLaunchAtLogin() {
@@ -435,6 +487,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func requestAwake(_ wanted: Bool) {
         wantsAwake = wanted
+        updateMenuState()
         // One pmset change at a time; on success the completion handler catches up to the latest wantsAwake.
         // A failed change is reported and rolled back to the observed state, not retried.
         guard wanted != awake, !sleepChangeInFlight else { return }
@@ -461,12 +514,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// pmset refused the change, so sleep behaviour is still whatever `awake` says. Bring intent, the persisted
-    /// config, the assertion and the menu back to that, or every one of them claims a state the Mac is not in.
+    /// pmset refused the change, so sleep behaviour is still whatever `awake` says. Bring the runtime state — intent,
+    /// the assertion, the menu — back to that. `config` is deliberately untouched: it records what the user asked
+    /// for, and a transient permission failure must not erase that from disk.
     private func rollBackFailedSleepChange() {
         wantsAwake = awake
-        config.mode = awake ? .on : .off
-        saveConfig(config)
         updateDisplayAssertion()
         updateMenuState()
         reportSleepControlFailure()
@@ -532,13 +584,16 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Cleanup
 
-    private func cleanup() {
+    /// - Returns: whether the Mac was handed back its sleep settings. A `false` return leaves `originalSleep` in
+    ///   place so the next launch retries, but the user who just quit has no reason to launch again — every caller
+    ///   must report it. A repeat call returns `true`: the first one owns reporting.
+    private func cleanup() -> Bool {
         let shouldRun = cleanupQueue.sync { () -> Bool in
             if _cleanedUp { return false }
             _cleanedUp = true
             return true
         }
-        guard shouldRun else { return }
+        guard shouldRun else { return true }
         displayAssertion.setActive(false)
         // Through sleepQueue so an enable already running finishes first — otherwise the two pmset pairs interleave
         // and the enable can land last, leaving sleep disabled with the recovery key already removed.
@@ -546,11 +601,29 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let ok = sleepQueue.sync { setSleepPrevention(enabled: false, restoreSleep: restore) }
         if ok {
             UserDefaults.standard.removeObject(forKey: "originalSleep")
+        } else {
+            fputs("Warning: could not restore sleep settings on exit\n", stderr)
         }
+        return ok
+    }
+
+    /// Exit paths the user did not drive get a notification: there is no window left to put a modal on, and the
+    /// alternative is the Mac never sleeping again with nothing said.
+    private func reportCleanupFailure() {
+        guard notificationsAllowed else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "StayAwake"
+        content.subtitle = "Sleep settings not restored"
+        content.body = CLEANUP_FAILURE_REMEDY
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "cleanup-failed", content: content, trigger: nil)
+        )
     }
 
     @objc private func quitApp() {
-        cleanup()
+        if !cleanup() {
+            showFailureAlert("StayAwake could not restore sleep settings", CLEANUP_FAILURE_REMEDY)
+        }
         NSApp.terminate(nil)
     }
 }
