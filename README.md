@@ -1,16 +1,12 @@
 # StayAwake
 
-A macOS menu bar app that keeps your Mac awake while dev processes are running, and lets it sleep when they stop.
-
-No configuration needed. Just run it.
+A macOS menu bar app that keeps your Mac awake — even with the lid closed — until you turn it off.
 
 ## How it works
 
-StayAwake polls your running processes every 10 seconds. If anything from its watchlist is running (Node, Docker, Python, Claude CLI, etc.) it prevents your Mac from sleeping. When they stop, sleep is restored automatically.
+Turn on **Keep Awake** in the menu and your Mac won't sleep, even with the lid closed. Close the lid and walk away — your dev server, Docker containers, and long-running scripts keep going. Turn it off and your normal sleep settings come back.
 
-This means you can close your lid and walk away — your dev server, Docker containers, and long-running scripts keep going.
-
-While active, StayAwake also keeps the display awake so your Mac doesn't idle into the screen saver or lock screen. Toggle this with **Prevent Screen Lock** in the menu.
+While on, StayAwake also keeps the display awake so your Mac doesn't idle into the screen saver or lock screen. Toggle this with **Prevent Screen Lock**.
 
 ## Build
 
@@ -26,46 +22,22 @@ Produces `dist/StayAwake.app` — a universal binary (Apple Silicon + Intel).
 
 ## Menu bar
 
-The sun icon appears in your menu bar — bright when preventing sleep, faded when idle. Click it for status, mode control, the screen lock toggle, and settings.
+The sun icon appears in your menu bar — bright when preventing sleep, faded when idle. Click it for:
 
-## Modes
+- **Keep Awake** — on or off. Remembered across restarts
+- **Prevent Screen Lock** — keep the display on while awake
+- **Launch at Login**
 
-Three operating modes, accessible from the **Mode** submenu:
+## Config
 
-- **Auto** — Detect watched processes and toggle sleep automatically (default)
-- **Always On** — Prevent sleep regardless of running processes
-- **Always Off** — Allow sleep regardless of running processes
-
-Mode is persisted in settings — survives restarts.
-
-## Settings
-
-Change the check interval, process watchlist, and launch-at-login via **Settings…** in the menu. Config saved to `~/.stayawake.json`:
+Saved to `~/.stayawake.json`:
 
 ```json
 {
-  "interval": 10,
-  "mode": "auto",
-  "preventScreenLock": true,
-  "processes": ["node", "python3", "claude"]
+  "mode": "on",
+  "preventScreenLock": true
 }
 ```
-
-## Default watchlist
-
-```
-node, npm, pnpm, yarn, bun
-python, python3
-docker, docker-compose
-ruby, rails
-go, cargo
-java
-vite, webpack, next, nuxt, gatsby
-postgres, mysql, redis, mongod
-claude
-```
-
-Add your own via Settings, or edit `~/.stayawake.json` directly.
 
 ## Requirements
 
@@ -76,16 +48,13 @@ Add your own via Settings, or edit `~/.stayawake.json` directly.
 
 AI coding agents like Claude Code, Copilot, Cursor, and Devin run long autonomous sessions — generating code, running tests, deploying. If your Mac sleeps mid-task, the agent loses its connection, context resets, and work is wasted.
 
-StayAwake solves this by detecting agent processes (`claude`, `node`, `python`, etc.) and keeping your Mac awake for exactly as long as they're running. Close the lid, walk away, come back to a finished task — not a stale SSH timeout or a half-completed refactor.
-
-No manual toggling. No forgetting to turn it off. Sleep resumes the moment the agent exits.
+Turn StayAwake on before you walk away. Close the lid, come back to a finished task — not a stale SSH timeout or a half-completed refactor.
 
 ## Known limitations
 
 - Requires one-time sudoers setup per user (managed/locked-down Macs may not allow this)
 - Not signed or notarized — requires right-click > Open on first launch
-- Traps heat when lid is closed — do not put in a bag while awake
-- Process matching is by name — a hung process that hasn't exited will keep the Mac awake
+- Traps heat when lid is closed — do not put in a bag while awake, and turn it off when you're done
 - Prevent Screen Lock only stops the *idle* lock — closing the lid, locking manually (⌃⌘Q), or a fast user switch still locks. It also keeps the display on, which costs battery
 
 ## License
