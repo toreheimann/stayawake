@@ -86,8 +86,88 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(Set(json.keys), ["mode", "preventScreenLock"])
     }
 
-    func testWrongTypeFails() {
-        XCTAssertThrowsError(try decode(#"{"preventScreenLock": "yes"}"#))
+    func testWrongTypeFallsBackToDefault() throws {
+        let decoded = try decode(#"{"preventScreenLock": "yes"}"#)
+        XCTAssertTrue(decoded.preventScreenLock)
+    }
+
+    func testMalformedKeyDoesNotDiscardTheRest() throws {
+        let decoded = try decode(#"{"mode": "off", "preventScreenLock": "yes"}"#)
+        XCTAssertEqual(decoded.mode, .off)
+        XCTAssertTrue(decoded.preventScreenLock)
+    }
+
+    func testMalformedModeDoesNotDiscardTheRest() throws {
+        let decoded = try decode(#"{"mode": 5, "preventScreenLock": false}"#)
+        XCTAssertEqual(decoded.mode, StayAwakeConfig.default.mode)
+        XCTAssertFalse(decoded.preventScreenLock)
+    }
+}
+
+// MARK: - Load Config
+
+final class LoadConfigTests: XCTestCase {
+    private var path = ""
+
+    override func setUp() {
+        super.setUp()
+        path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(atPath: path)
+        super.tearDown()
+    }
+
+    private func write(_ contents: String) throws {
+        try contents.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    func testMissingFileUsesDefaults() {
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, StayAwakeConfig.default.mode)
+        XCTAssertNil(result.rejectionReason)
+    }
+
+    func testValidFileLoads() throws {
+        try write(#"{"mode": "off", "preventScreenLock": false}"#)
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertFalse(result.config.preventScreenLock)
+        XCTAssertNil(result.rejectionReason)
+    }
+
+    func testMalformedJSONFallsBackToSafeStateAndReportsWhy() throws {
+        try write("{ this is not json")
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off, "an unreadable config must not mean \"force the Mac awake\"")
+        XCTAssertFalse(result.config.preventScreenLock)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testNonObjectJSONFallsBackToSafeState() throws {
+        try write("[1, 2, 3]")
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testSymlinkFallsBackToSafeState() throws {
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try #"{"mode": "on"}"#.write(to: target, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: target.path)
+        defer { try? FileManager.default.removeItem(at: target) }
+
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testOversizedFileFallsBackToSafeState() throws {
+        try write(String(repeating: " ", count: Int(MAX_CONFIG_SIZE) + 1))
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertNotNil(result.rejectionReason)
     }
 }
 
@@ -158,10 +238,16 @@ final class ModeTests: XCTestCase {
         XCTAssertEqual(mode, .off)
     }
 
-    func testInvalidModeFallsBackToOn() throws {
+    func testInvalidModeFallsBackToOff() throws {
         let data = Data("\"banana\"".utf8)
         let mode = try JSONDecoder().decode(Mode.self, from: data)
-        XCTAssertEqual(mode, .on)
+        XCTAssertEqual(mode, .off)
+    }
+
+    func testEmptyModeFallsBackToOff() throws {
+        let data = Data("\"\"".utf8)
+        let mode = try JSONDecoder().decode(Mode.self, from: data)
+        XCTAssertEqual(mode, .off)
     }
 
     func testModeRoundTrip() throws {
