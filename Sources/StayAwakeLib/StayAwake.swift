@@ -7,6 +7,9 @@ let PMSET = "/usr/bin/pmset"
 let CONFIG_PATH = NSString("~/.stayawake.json").expandingTildeInPath
 let MAX_CONFIG_SIZE: UInt64 = 1_048_576
 let CLEANUP_FAILURE_REMEDY = "The Mac is still set not to sleep. Run `sudo pmset -a disablesleep 0` in Terminal, or launch StayAwake again to restore it."
+/// How long an exiting process waits for a cleanup-failure report to be taken before falling back to a modal.
+/// The callers exit on their next statement, so the wait has to be bounded.
+let CLEANUP_REPORT_TIMEOUT: DispatchTimeInterval = .seconds(2)
 
 var appVersion: String {
     Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -17,14 +20,20 @@ var appVersion: String {
 enum Mode: String, Codable {
     case on, off
 
-    /// The removed `auto` mode migrates to `.on`; any other unrecognized value is not something this app wrote,
-    /// so it falls back to `.off` rather than silently forcing the Mac awake.
+    /// The removed `auto` mode migrates to `.on`; any other unrecognized value is not something this app wrote and
+    /// is rejected rather than resolved to a case, so ``StayAwakeConfig`` can name it in
+    /// ``StayAwakeConfig/malformedKeys`` instead of silently substituting a mode the user never asked for.
     init(from decoder: Decoder) throws {
-        let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
-        case "auto": self = .on
-        default: self = Mode(rawValue: raw) ?? .off
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        if raw == "auto" {
+            self = .on
+            return
         }
+        guard let mode = Mode(rawValue: raw) else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "unrecognized mode \"\(raw)\"")
+        }
+        self = mode
     }
 }
 
@@ -267,6 +276,22 @@ private func runProcess(_ path: String, args: [String]) -> Bool {
     guard (try? task.run()) != nil else { return false }
     task.waitUntilExit()
     return task.terminationStatus == 0
+}
+
+// MARK: - Exit Reporting
+
+/// Blocks until asynchronous work reports that it was accepted, so a caller about to exit does not die before the
+/// work it asked for has been taken.
+///
+/// Only acceptance is signalled: a submission that fails times out into the caller's fallback rather than needing a
+/// second channel to carry an error back across the wait.
+///
+/// - Parameter submit: receives a callback to invoke once, and only if the work was accepted.
+/// - Returns: whether acceptance arrived inside `timeout`.
+func waitForAcceptance(within timeout: DispatchTimeInterval, _ submit: (@escaping () -> Void) -> Void) -> Bool {
+    let accepted = DispatchSemaphore(value: 0)
+    submit { accepted.signal() }
+    return accepted.wait(timeout: .now() + timeout) == .success
 }
 
 // MARK: - App Delegate
@@ -609,15 +634,33 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Exit paths the user did not drive get a notification: there is no window left to put a modal on, and the
     /// alternative is the Mac never sleeping again with nothing said.
+    ///
+    /// Blocks until the request is taken, because both callers exit on their next statement and an untaken request
+    /// dies with the process. A notification that cannot be sent, or is not taken in time, falls back to the modal —
+    /// the report is never dropped just because the preferred channel was unavailable.
     private func reportCleanupFailure() {
-        guard notificationsAllowed else { return }
+        let title = "StayAwake could not restore sleep settings"
+
+        guard notificationsAllowed else {
+            showFailureAlert(title, CLEANUP_FAILURE_REMEDY)
+            return
+        }
+
         let content = UNMutableNotificationContent()
         content.title = "StayAwake"
         content.subtitle = "Sleep settings not restored"
         content.body = CLEANUP_FAILURE_REMEDY
-        UNUserNotificationCenter.current().add(
-            UNNotificationRequest(identifier: "cleanup-failed", content: content, trigger: nil)
-        )
+        let request = UNNotificationRequest(identifier: "cleanup-failed", content: content, trigger: nil)
+
+        let reported = waitForAcceptance(within: CLEANUP_REPORT_TIMEOUT) { accept in
+            UNUserNotificationCenter.current().add(request) { error in
+                guard error == nil else { return }
+                accept()
+            }
+        }
+        if !reported {
+            showFailureAlert(title, CLEANUP_FAILURE_REMEDY)
+        }
     }
 
     @objc private func quitApp() {

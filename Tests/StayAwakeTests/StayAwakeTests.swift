@@ -114,6 +114,13 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(decoded.malformedKeys, ["mode"])
     }
 
+    func testUnrecognizedModeStringFallsBackToSafeValueAndIsReported() throws {
+        let decoded = try decode(#"{"mode": "On", "preventScreenLock": false}"#)
+        XCTAssertEqual(decoded.mode, .off, "a mode we could not read must not force the Mac awake")
+        XCTAssertEqual(decoded.malformedKeys, ["mode"],
+                       "an unreadable value is named whatever JSON type it arrived as")
+    }
+
     func testEveryMalformedKeyIsReported() throws {
         let decoded = try decode(#"{"mode": 5, "preventScreenLock": "yes"}"#)
         XCTAssertEqual(decoded.mode, .off)
@@ -207,6 +214,13 @@ final class LoadConfigTests: XCTestCase {
         XCTAssertEqual(result.config.mode, .on, "a readable key survives a malformed sibling")
         XCTAssertFalse(result.config.preventScreenLock)
         XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testUnrecognizedModeStringReportsWhy() throws {
+        try write(#"{"mode": "On", "preventScreenLock": false}"#)
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertNotNil(result.rejectionReason, "a key we could not read must reach the launch alert")
     }
 
     func testRejectionReasonNamesTheMalformedKeys() throws {
@@ -325,16 +339,16 @@ final class ModeTests: XCTestCase {
         XCTAssertEqual(mode, .off)
     }
 
-    func testInvalidModeFallsBackToOff() throws {
+    // Rejecting rather than absorbing is what lets `StayAwakeConfig` name the key in `malformedKeys`; the `.off`
+    // outcome an unreadable mode still produces is pinned by `ConfigTests` and `LoadConfigTests`.
+    func testInvalidModeIsRejected() {
         let data = Data("\"banana\"".utf8)
-        let mode = try JSONDecoder().decode(Mode.self, from: data)
-        XCTAssertEqual(mode, .off)
+        XCTAssertThrowsError(try JSONDecoder().decode(Mode.self, from: data))
     }
 
-    func testEmptyModeFallsBackToOff() throws {
+    func testEmptyModeIsRejected() {
         let data = Data("\"\"".utf8)
-        let mode = try JSONDecoder().decode(Mode.self, from: data)
-        XCTAssertEqual(mode, .off)
+        XCTAssertThrowsError(try JSONDecoder().decode(Mode.self, from: data))
     }
 
     func testModeRoundTrip() throws {
@@ -343,6 +357,31 @@ final class ModeTests: XCTestCase {
             let decoded = try JSONDecoder().decode(Mode.self, from: data)
             XCTAssertEqual(decoded, mode)
         }
+    }
+}
+
+// MARK: - Wait For Acceptance
+
+final class WaitForAcceptanceTests: XCTestCase {
+    func testSynchronousAcceptanceIsReported() {
+        XCTAssertTrue(waitForAcceptance(within: .seconds(2)) { accept in accept() })
+    }
+
+    func testAsynchronousAcceptanceIsAwaited() {
+        var acceptedBeforeReturning = false
+        let reported = waitForAcceptance(within: .seconds(2)) { accept in
+            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) {
+                acceptedBeforeReturning = true
+                accept()
+            }
+        }
+        XCTAssertTrue(reported)
+        XCTAssertTrue(acceptedBeforeReturning, "a caller about to exit must not return before the work is taken")
+    }
+
+    func testWorkThatIsNeverAcceptedTimesOut() {
+        XCTAssertFalse(waitForAcceptance(within: .milliseconds(50)) { _ in },
+                       "work that is never taken must fall through to the caller's fallback")
     }
 }
 
