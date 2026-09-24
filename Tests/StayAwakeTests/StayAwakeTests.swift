@@ -1,4 +1,5 @@
 import IOKit.pwr_mgt
+import UserNotifications
 import XCTest
 @testable import StayAwakeLib
 
@@ -382,6 +383,33 @@ final class WaitForAcceptanceTests: XCTestCase {
     func testWorkThatIsNeverAcceptedTimesOut() {
         XCTAssertFalse(waitForAcceptance(within: .milliseconds(50)) { _ in },
                        "work that is never taken must fall through to the caller's fallback")
+    }
+}
+
+// MARK: - Notification Presentability
+
+final class NotificationCanPresentTests: XCTestCase {
+    func testAuthorizedWithAlertsEnabledCanPresent() {
+        XCTAssertTrue(notificationCanPresent(authorizationStatus: .authorized, alertSetting: .enabled))
+    }
+
+    func testRevokedAuthorizationCannotPresent() {
+        XCTAssertFalse(notificationCanPresent(authorizationStatus: .denied, alertSetting: .enabled),
+                       "permission granted at launch can be revoked before the exit path reports")
+    }
+
+    func testAlertsTurnedOffCannotPresent() {
+        XCTAssertFalse(notificationCanPresent(authorizationStatus: .authorized, alertSetting: .disabled),
+                       "a report that is accepted and never shown is the same silence as not reporting")
+    }
+
+    func testProvisionalAuthorizationCannotPresent() {
+        XCTAssertFalse(notificationCanPresent(authorizationStatus: .provisional, alertSetting: .enabled),
+                       "quiet delivery cannot carry a report the user has to act on")
+    }
+
+    func testUndeterminedAuthorizationCannotPresent() {
+        XCTAssertFalse(notificationCanPresent(authorizationStatus: .notDetermined, alertSetting: .notSupported))
     }
 }
 

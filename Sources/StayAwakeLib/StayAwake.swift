@@ -10,6 +10,9 @@ let CLEANUP_FAILURE_REMEDY = "The Mac is still set not to sleep. Run `sudo pmset
 /// How long an exiting process waits for a cleanup-failure report to be taken before falling back to a modal.
 /// The callers exit on their next statement, so the wait has to be bounded.
 let CLEANUP_REPORT_TIMEOUT: DispatchTimeInterval = .seconds(2)
+/// How long that fallback modal stays up before the exit continues without a dismissal. Nobody is at the Mac on a
+/// logout- or signal-driven exit, so an alert that waits for a click holds the exit open until the OS kills it.
+let CLEANUP_ALERT_TIMEOUT: TimeInterval = 5
 
 var appVersion: String {
     Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -294,6 +297,16 @@ func waitForAcceptance(within timeout: DispatchTimeInterval, _ submit: (@escapin
     return accepted.wait(timeout: .now() + timeout) == .success
 }
 
+/// Whether a report submitted now would be presented, rather than merely accepted.
+///
+/// An exit path asks this instead of trusting the authorization captured at launch, which does not survive the user
+/// revoking permission or switching alerts off for an app that is still authorized. Acceptance by the notification
+/// centre is not delivery, so anything short of a channel that presents belongs in the alert fallback.
+func notificationCanPresent(authorizationStatus: UNAuthorizationStatus,
+                            alertSetting: UNNotificationSetting) -> Bool {
+    authorizationStatus == .authorized && alertSetting == .enabled
+}
+
 // MARK: - App Delegate
 
 public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -574,11 +587,27 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// The only failure channel this app has: it is an LSUIElement, so stderr reaches nobody.
     private func showFailureAlert(_ messageText: String, _ informativeText: String) {
+        failureAlert(messageText, informativeText).runModal()
+    }
+
+    /// Same alert, but it gives up on the dismissal after `timeout`, for callers whose next statement ends the
+    /// process. `runModal` returns only when a human clicks, which is a wait an unattended exit cannot make.
+    private func showFailureAlert(_ messageText: String, _ informativeText: String,
+                                  dismissingAfter timeout: TimeInterval) {
+        let alert = failureAlert(messageText, informativeText)
+        // Scheduled in `.modalPanel` so it still fires once the alert has taken over the run loop.
+        let dismiss = Timer(timeInterval: timeout, repeats: false) { _ in NSApp.abortModal() }
+        RunLoop.main.add(dismiss, forMode: .modalPanel)
+        alert.runModal()
+        dismiss.invalidate()
+    }
+
+    private func failureAlert(_ messageText: String, _ informativeText: String) -> NSAlert {
         let alert = NSAlert()
         alert.messageText = messageText
         alert.informativeText = informativeText
         alert.alertStyle = .warning
-        alert.runModal()
+        return alert
     }
 
     // MARK: Permissions
@@ -632,19 +661,14 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return ok
     }
 
-    /// Exit paths the user did not drive get a notification: there is no window left to put a modal on, and the
-    /// alternative is the Mac never sleeping again with nothing said.
+    /// The reporter for the two exit paths the user did not drive. Every channel it uses is bounded, because both
+    /// callers end the process on their next statement and a wait that outlives that window is a report nobody sees.
     ///
-    /// Blocks until the request is taken, because both callers exit on their next statement and an untaken request
-    /// dies with the process. A notification that cannot be sent, or is not taken in time, falls back to the modal —
-    /// the report is never dropped just because the preferred channel was unavailable.
+    /// A notification is preferred — there is no window left to put a modal on — but only once the live settings say
+    /// it would be presented, so the report is not handed to a channel the user has since switched off. Anything
+    /// else, including a request that is not taken in time, falls through to the alert, which cannot be suppressed.
     private func reportCleanupFailure() {
         let title = "StayAwake could not restore sleep settings"
-
-        guard notificationsAllowed else {
-            showFailureAlert(title, CLEANUP_FAILURE_REMEDY)
-            return
-        }
 
         let content = UNMutableNotificationContent()
         content.title = "StayAwake"
@@ -652,14 +676,19 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         content.body = CLEANUP_FAILURE_REMEDY
         let request = UNNotificationRequest(identifier: "cleanup-failed", content: content, trigger: nil)
 
+        let center = UNUserNotificationCenter.current()
         let reported = waitForAcceptance(within: CLEANUP_REPORT_TIMEOUT) { accept in
-            UNUserNotificationCenter.current().add(request) { error in
-                guard error == nil else { return }
-                accept()
+            center.getNotificationSettings { settings in
+                guard notificationCanPresent(authorizationStatus: settings.authorizationStatus,
+                                             alertSetting: settings.alertSetting) else { return }
+                center.add(request) { error in
+                    guard error == nil else { return }
+                    accept()
+                }
             }
         }
         if !reported {
-            showFailureAlert(title, CLEANUP_FAILURE_REMEDY)
+            showFailureAlert(title, CLEANUP_FAILURE_REMEDY, dismissingAfter: CLEANUP_ALERT_TIMEOUT)
         }
     }
 
