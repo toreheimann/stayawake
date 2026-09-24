@@ -55,6 +55,7 @@ Turn StayAwake on before you walk away. Close the lid, come back to a finished t
 - Requires one-time sudoers setup per user (managed/locked-down Macs may not allow this)
 - Not signed or notarized — requires right-click > Open on first launch
 - Traps heat when lid is closed — do not put in a bag while awake, and turn it off when you're done
+- If restoring sleep settings fails on quit, StayAwake retries on its next launch (or run `sudo pmset -a disablesleep 0`)
 - Prevent Screen Lock only stops the *idle* lock — closing the lid, locking manually (⌃⌘Q), or a fast user switch still locks. It also keeps the display on, which costs battery
 
 ## License

@@ -1,5 +1,4 @@
 import IOKit.pwr_mgt
-import UserNotifications
 import XCTest
 @testable import StayAwakeLib
 
@@ -361,92 +360,6 @@ final class ModeTests: XCTestCase {
     }
 }
 
-// MARK: - Wait For Report
-
-final class WaitForReportTests: XCTestCase {
-    func testSynchronousAcceptanceIsReported() {
-        XCTAssertTrue(waitForReport(within: .seconds(2)) { resolve in resolve(true) })
-    }
-
-    func testAsynchronousAcceptanceIsAwaited() {
-        var acceptedBeforeReturning = false
-        let reported = waitForReport(within: .seconds(2)) { resolve in
-            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) {
-                acceptedBeforeReturning = true
-                resolve(true)
-            }
-        }
-        XCTAssertTrue(reported)
-        XCTAssertTrue(acceptedBeforeReturning, "a caller about to exit must not return before the work is taken")
-    }
-
-    func testWorkThatIsNeverReportedTimesOut() {
-        XCTAssertFalse(waitForReport(within: .milliseconds(50)) { _ in },
-                       "work that is never taken must fall through to the caller's fallback")
-    }
-
-    func testRefusalIsReported() {
-        XCTAssertFalse(waitForReport(within: .seconds(2)) { resolve in resolve(false) })
-    }
-
-    func testRefusalDoesNotBurnTheBudget() {
-        let started = Date()
-        _ = waitForReport(within: .seconds(2)) { resolve in resolve(false) }
-        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5,
-                          "a channel that has already refused must not hold an exiting process to its deadline")
-    }
-}
-
-// MARK: - Submit Notification Report
-
-final class SubmitNotificationReportTests: XCTestCase {
-    private func makeRequest() -> UNNotificationRequest {
-        UNNotificationRequest(identifier: "test", content: UNMutableNotificationContent(), trigger: nil)
-    }
-
-    /// - Returns: whether the report was reported as presentable, and whether it reached `add` at all.
-    private func submit(status: UNAuthorizationStatus,
-                        alertSetting: UNNotificationSetting,
-                        addError: Error? = nil) -> (presented: Bool?, reachedAdd: Bool) {
-        var presented: Bool?
-        var reachedAdd = false
-        submitNotificationReport(
-            makeRequest(),
-            fetchSettings: { yield in yield(status, alertSetting) },
-            add: { _, done in
-                reachedAdd = true
-                done(addError)
-            },
-            completion: { presented = $0 }
-        )
-        return (presented, reachedAdd)
-    }
-
-    func testPresentableAndAcceptedReportsSuccess() {
-        let result = submit(status: .authorized, alertSetting: .enabled)
-        XCTAssertEqual(result.presented, true)
-        XCTAssertTrue(result.reachedAdd)
-    }
-
-    func testAlertsTurnedOffAfterLaunchReportsFailureAndSubmitsNothing() {
-        let result = submit(status: .authorized, alertSetting: .disabled)
-        XCTAssertEqual(result.presented, false, "acceptance by a channel that will not present is not a report")
-        XCTAssertFalse(result.reachedAdd, "nothing is handed to a channel the live settings say cannot present it")
-    }
-
-    func testAuthorizationRevokedAfterLaunchReportsFailure() {
-        let result = submit(status: .denied, alertSetting: .enabled)
-        XCTAssertEqual(result.presented, false, "permission granted at launch can be revoked before the report")
-        XCTAssertFalse(result.reachedAdd)
-    }
-
-    func testRefusedRequestReportsFailure() {
-        let result = submit(status: .authorized, alertSetting: .enabled,
-                            addError: NSError(domain: "test", code: 1))
-        XCTAssertEqual(result.presented, false)
-    }
-}
-
 // MARK: - Retry Unfinished Sleep Restore
 
 final class RetryUnfinishedSleepRestoreTests: XCTestCase {
@@ -480,33 +393,6 @@ final class RetryUnfinishedSleepRestoreTests: XCTestCase {
 
     func testFailedRetryOwesTheClampedValue() {
         XCTAssertEqual(retryUnfinishedSleepRestore(saved: 0) { _ in false }, 1)
-    }
-}
-
-// MARK: - Notification Presentability
-
-final class NotificationCanPresentTests: XCTestCase {
-    func testAuthorizedWithAlertsEnabledCanPresent() {
-        XCTAssertTrue(notificationCanPresent(authorizationStatus: .authorized, alertSetting: .enabled))
-    }
-
-    func testRevokedAuthorizationCannotPresent() {
-        XCTAssertFalse(notificationCanPresent(authorizationStatus: .denied, alertSetting: .enabled),
-                       "permission granted at launch can be revoked before the exit path reports")
-    }
-
-    func testAlertsTurnedOffCannotPresent() {
-        XCTAssertFalse(notificationCanPresent(authorizationStatus: .authorized, alertSetting: .disabled),
-                       "a report that is accepted and never shown is the same silence as not reporting")
-    }
-
-    func testProvisionalAuthorizationCannotPresent() {
-        XCTAssertFalse(notificationCanPresent(authorizationStatus: .provisional, alertSetting: .enabled),
-                       "quiet delivery cannot carry a report the user has to act on")
-    }
-
-    func testUndeterminedAuthorizationCannotPresent() {
-        XCTAssertFalse(notificationCanPresent(authorizationStatus: .notDetermined, alertSetting: .notSupported))
     }
 }
 
