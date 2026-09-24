@@ -1,10 +1,12 @@
 import AppKit
+import IOKit.pwr_mgt
 import ServiceManagement
 import UserNotifications
 
 let PMSET = "/usr/bin/pmset"
 let CONFIG_PATH = NSString("~/.stayawake.json").expandingTildeInPath
 let MAX_CONFIG_SIZE: UInt64 = 1_048_576
+let MAX_INTERVAL = 300
 
 let DEFAULT_PROCESSES = [
     "node", "npm", "pnpm", "yarn", "bun",
@@ -39,6 +41,7 @@ struct StayAwakeConfig: Codable {
     var interval: Int
     var mode: Mode
     var processes: [String]
+    var preventScreenLock = true
 
     static let `default` = StayAwakeConfig(
         interval: 10,
@@ -47,9 +50,20 @@ struct StayAwakeConfig: Codable {
     )
 }
 
+extension StayAwakeConfig {
+    /// Keys added after the first release decode leniently so existing config files keep loading.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        interval = try container.decode(Int.self, forKey: .interval)
+        mode = try container.decode(Mode.self, forKey: .mode)
+        processes = try container.decode([String].self, forKey: .processes)
+        preventScreenLock = try container.decodeIfPresent(Bool.self, forKey: .preventScreenLock) ?? true
+    }
+}
+
 func validateConfig(_ config: StayAwakeConfig) -> StayAwakeConfig {
     var config = config
-    if config.interval < 1 || config.interval > 300 {
+    if config.interval < 1 || config.interval > MAX_INTERVAL {
         config.interval = StayAwakeConfig.default.interval
     }
     config.processes = config.processes.filter { !$0.isEmpty }
@@ -106,33 +120,72 @@ func migrateConfigIfNeeded() {
 
 // MARK: - Process Monitor
 
-func parseProcessList(_ output: String, excludingPid: Int32) -> Set<String> {
-    var procs = Set<String>()
-    for line in output.split(separator: "\n") {
-        let parts = line.trimmingCharacters(in: .whitespaces)
-            .split(maxSplits: 1, omittingEmptySubsequences: true) { $0.isWhitespace }
-        guard parts.count == 2, let pid = Int32(parts[0]), pid != excludingPid else { continue }
-        let name = String(parts[1]).split(separator: "/").last.map(String.init) ?? String(parts[1])
-        procs.insert(name.trimmingCharacters(in: .whitespaces).lowercased())
-    }
-    return procs
+func normalizeProcessName(_ raw: String) -> String {
+    let name = raw.split(separator: "/").last.map(String.init) ?? raw
+    return name.trimmingCharacters(in: .whitespaces).lowercased()
 }
 
-func getRunningProcesses() -> Set<String> {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/bin/ps")
-    task.arguments = ["axo", "pid,comm"]
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = FileHandle.nullDevice
+/// Extracts argv[0] from a `KERN_PROCARGS2` buffer: `Int32` argc, exec path, NUL padding, then argv strings.
+func parseArgv0(procArgs buffer: UnsafeRawBufferPointer) -> String? {
+    var i = MemoryLayout<Int32>.size
+    guard buffer.count > i, buffer.loadUnaligned(as: Int32.self) > 0 else { return nil }
+    while i < buffer.count, buffer[i] != 0 { i += 1 }
+    while i < buffer.count, buffer[i] == 0 { i += 1 }
+    let start = i
+    while i < buffer.count, buffer[i] != 0 { i += 1 }
+    guard i > start, i < buffer.count else { return nil }
+    return String(decoding: buffer[start..<i], as: UTF8.self)
+}
 
-    guard (try? task.run()) != nil else { return [] }
+private func readArgv0(pid: pid_t, buffer: UnsafeMutableRawBufferPointer) -> String? {
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = buffer.count
+    guard sysctl(&mib, 3, buffer.baseAddress, &size, nil, 0) == 0 else { return nil }
+    return parseArgv0(procArgs: UnsafeRawBufferPointer(rebasing: buffer[..<size]))
+}
 
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    task.waitUntilExit()
+private func kernelName(of proc: kinfo_proc) -> String {
+    withUnsafeBytes(of: proc.kp_proc.p_comm) { bytes in
+        String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+    }
+}
 
-    guard let output = String(data: data, encoding: .utf8) else { return [] }
-    return parseProcessList(output, excludingPid: ProcessInfo.processInfo.processIdentifier)
+private func listAllProcesses() -> [kinfo_proc]? {
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+    for _ in 0..<3 {
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0 else { return nil }
+        size += size / 8
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride)
+        if sysctl(&mib, 4, &procs, &size, nil, 0) == 0 {
+            return Array(procs.prefix(size / MemoryLayout<kinfo_proc>.stride))
+        }
+        guard errno == ENOMEM else { return nil }
+    }
+    return nil
+}
+
+/// Normalized names of all live processes except this one: argv[0] where readable (so process
+/// titles like `next-server` match), otherwise the kernel's truncated `p_comm`.
+/// Returns nil when the process table can't be read, so callers can keep their current state.
+func getRunningProcesses() -> Set<String>? {
+    guard let procs = listAllProcesses() else { return nil }
+
+    var argMax: Int32 = 0
+    var argMaxSize = MemoryLayout<Int32>.size
+    var argMaxMib: [Int32] = [CTL_KERN, KERN_ARGMAX]
+    guard sysctl(&argMaxMib, 2, &argMax, &argMaxSize, nil, 0) == 0, argMax > 0 else { return nil }
+    let args = UnsafeMutableRawBufferPointer.allocate(byteCount: Int(argMax), alignment: MemoryLayout<Int32>.alignment)
+    defer { args.deallocate() }
+
+    let ownPid = getpid()
+    var names = Set<String>()
+    for proc in procs where proc.kp_proc.p_pid != ownPid && Int32(proc.kp_proc.p_stat) != SZOMB {
+        let raw = readArgv0(pid: proc.kp_proc.p_pid, buffer: args) ?? kernelName(of: proc)
+        let name = normalizeProcessName(raw)
+        if !name.isEmpty { names.insert(name) }
+    }
+    return names
 }
 
 func processNameMatches(_ processName: String, key: String) -> Bool {
@@ -168,6 +221,36 @@ func sanitizeForDisplay(_ name: String) -> String {
     let cleaned = name.unicodeScalars.filter { !unsafeDisplayScalars.contains($0) }
     let result = String(String.UnicodeScalarView(cleaned))
     return result.count > 50 ? String(result.prefix(50)) + "…" : result
+}
+
+// MARK: - Display Sleep Assertion
+
+/// Holds a `PreventUserIdleDisplaySleep` power assertion while active.
+final class DisplaySleepAssertion {
+    private var id = IOPMAssertionID(kIOPMNullAssertionID)
+
+    var isActive: Bool { id != IOPMAssertionID(kIOPMNullAssertionID) }
+
+    func setActive(_ active: Bool) {
+        guard active != isActive else { return }
+        if !active {
+            IOPMAssertionRelease(id)
+            id = IOPMAssertionID(kIOPMNullAssertionID)
+            return
+        }
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "StayAwake is preventing idle display sleep and screen lock" as CFString,
+            &id
+        )
+        if result != kIOReturnSuccess {
+            id = IOPMAssertionID(kIOPMNullAssertionID)
+            fputs("Warning: could not create display sleep assertion (\(result))\n", stderr)
+        }
+    }
+
+    deinit { setActive(false) }
 }
 
 // MARK: - Sleep Controller
@@ -268,11 +351,17 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private var modeAutoItem: NSMenuItem!
     private var modeOnItem: NSMenuItem!
     private var modeOffItem: NSMenuItem!
+    private var preventLockItem: NSMenuItem!
 
     private var config: StayAwakeConfig!
+    /// What mode/processes ask for; `awake` lags it until pmset succeeds.
+    private var wantsAwake = false
     private var awake = false
+    private var sleepChangeInFlight = false
     private var originalSleep: Int = 1
     private var pollTimer: Timer?
+    private var shownMatches: [String]?
+    private let displayAssertion = DisplaySleepAssertion()
 
     private var iconActive: NSImage?
     private var iconInactive: NSImage?
@@ -390,6 +479,13 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         modeItem.submenu = modeMenu
         menu.addItem(modeItem)
 
+        preventLockItem = NSMenuItem(title: "Prevent Screen Lock", action: #selector(onTogglePreventScreenLock), keyEquivalent: "")
+        preventLockItem.target = self
+        preventLockItem.image = NSImage(systemSymbolName: "lock.display", accessibilityDescription: "Prevent Screen Lock")
+        preventLockItem.toolTip = "Keep the display awake while StayAwake is active, so the Mac doesn't idle into the lock screen."
+        preventLockItem.state = config.preventScreenLock ? .on : .off
+        menu.addItem(preventLockItem)
+
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
@@ -426,24 +522,35 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         applyMode(startTimer: true)
     }
 
+    @objc private func onTogglePreventScreenLock() {
+        config.preventScreenLock.toggle()
+        saveConfig(config)
+        preventLockItem.state = config.preventScreenLock ? .on : .off
+        updateDisplayAssertion()
+    }
+
     private func applyMode(startTimer: Bool) {
         pollTimer?.invalidate()
         pollTimer = nil
+        removeMatchItems()
 
         switch config.mode {
         case .on:
-            if !awake { setAwake(true) }
+            requestAwake(true)
             activeItem.title = "Always On"
             statusItem.button?.setAccessibilityTitle("StayAwake — always on")
         case .off:
-            if awake { setAwake(false) }
+            requestAwake(false)
             activeItem.title = "Always Off"
             statusItem.button?.setAccessibilityTitle("StayAwake — always off")
         case .auto:
             if startTimer {
-                pollTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(config.interval), repeats: true) { [weak self] _ in
+                let interval = TimeInterval(config.interval)
+                let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
                     self?.poll()
                 }
+                timer.tolerance = interval / 10
+                pollTimer = timer
                 poll()
             }
         }
@@ -454,15 +561,12 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private func poll() {
         let processes = config.processes
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let running = getRunningProcesses()
+            guard let running = getRunningProcesses() else { return }
             let matches = findMatches(watched: processes, running: running)
-            let shouldBeAwake = !matches.isEmpty
 
             DispatchQueue.main.async {
-                guard let self else { return }
-                if shouldBeAwake != self.awake {
-                    self.setAwake(shouldBeAwake)
-                }
+                guard let self, self.config.mode == .auto else { return }
+                self.requestAwake(!matches.isEmpty)
                 self.updateStatusDisplay(matches: matches)
             }
         }
@@ -470,12 +574,18 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let extraItemTag = 100
 
-    private func updateStatusDisplay(matches: [String]) {
+    private func removeMatchItems() {
+        shownMatches = nil
         guard let menu = statusItem.menu else { return }
-
         while let item = menu.item(withTag: Self.extraItemTag) {
             menu.removeItem(item)
         }
+    }
+
+    private func updateStatusDisplay(matches: [String]) {
+        guard matches != shownMatches, let menu = statusItem.menu else { return }
+        removeMatchItems()
+        shownMatches = matches
 
         if matches.isEmpty {
             activeItem.title = "No watched processes running"
@@ -497,12 +607,23 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Sleep Control
 
-    private func setAwake(_ awake: Bool) {
+    private func updateDisplayAssertion() {
+        displayAssertion.setActive(wantsAwake && config.preventScreenLock)
+    }
+
+    private func requestAwake(_ wanted: Bool) {
+        wantsAwake = wanted
+        updateDisplayAssertion()
+        // One pmset change at a time; the completion handler catches up to the latest wantsAwake.
+        guard wanted != awake, !sleepChangeInFlight else { return }
+        sleepChangeInFlight = true
+
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self, !self.cleanedUp else { return }
-            let ok = setSleepPrevention(enabled: awake, restoreSleep: self.originalSleep)
+            let ok = setSleepPrevention(enabled: wanted, restoreSleep: self.originalSleep)
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.cleanedUp else { return }
+                self.sleepChangeInFlight = false
                 if !ok {
                     let content = UNMutableNotificationContent()
                     content.title = "StayAwake"
@@ -512,9 +633,12 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                     UNUserNotificationCenter.current().add(request)
                     return
                 }
-                self.awake = awake
-                self.statusItem.button?.image = awake ? self.iconActive : self.iconInactive
-                self.statusItem.button?.setAccessibilityTitle(awake ? "StayAwake — preventing sleep" : "StayAwake — idle")
+                self.awake = wanted
+                self.statusItem.button?.image = wanted ? self.iconActive : self.iconInactive
+                self.statusItem.button?.setAccessibilityTitle(wanted ? "StayAwake — preventing sleep" : "StayAwake — idle")
+                if self.wantsAwake != wanted {
+                    self.requestAwake(self.wantsAwake)
+                }
             }
         }
     }
@@ -644,7 +768,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
               let textView = settingsTextView,
               let loginCheck = settingsLoginCheck else { return }
 
-        let interval = max(1, Int(intervalField.stringValue) ?? config.interval)
+        let interval = min(MAX_INTERVAL, max(1, Int(intervalField.stringValue) ?? config.interval))
         let processes = textView.string.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
 
         config.interval = interval
@@ -685,6 +809,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
         guard shouldRun else { return }
+        displayAssertion.setActive(false)
         let ok = setSleepPrevention(enabled: false, restoreSleep: originalSleep)
         if ok {
             UserDefaults.standard.removeObject(forKey: "originalSleep")

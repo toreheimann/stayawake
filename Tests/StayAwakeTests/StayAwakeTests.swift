@@ -1,3 +1,4 @@
+import IOKit.pwr_mgt
 import XCTest
 @testable import StayAwakeLib
 
@@ -101,50 +102,104 @@ final class FindMatchesTests: XCTestCase {
     }
 }
 
-// MARK: - Parse Process List
+// MARK: - Normalize Process Name
 
-final class ParseProcessListTests: XCTestCase {
-    func testBasicParsing() {
-        let output = "  PID COMM\n  123 /usr/local/bin/node\n  456 /usr/bin/vim"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertEqual(procs, ["node", "vim"])
-    }
-
+final class NormalizeProcessNameTests: XCTestCase {
     func testExtractsBasename() {
-        let output = "  PID COMM\n  100 /usr/local/bin/python3.11"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertTrue(procs.contains("python3.11"))
+        XCTAssertEqual(normalizeProcessName("/usr/local/bin/python3.11"), "python3.11")
     }
 
     func testLowercases() {
-        let output = "  PID COMM\n  100 /usr/local/bin/Docker"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertTrue(procs.contains("docker"))
-    }
-
-    func testSkipsHeaderLine() {
-        let output = "  PID COMM\n  123 node"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertEqual(procs.count, 1)
-        XCTAssertTrue(procs.contains("node"))
-    }
-
-    func testExcludesPid() {
-        let output = "  100 node\n  200 vim"
-        let procs = parseProcessList(output, excludingPid: 100)
-        XCTAssertFalse(procs.contains("node"))
-        XCTAssertTrue(procs.contains("vim"))
-    }
-
-    func testEmptyOutput() {
-        let procs = parseProcessList("", excludingPid: 0)
-        XCTAssertTrue(procs.isEmpty)
+        XCTAssertEqual(normalizeProcessName("/usr/local/bin/Docker"), "docker")
     }
 
     func testBareProcessName() {
-        let output = "  100 node"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertTrue(procs.contains("node"))
+        XCTAssertEqual(normalizeProcessName("node"), "node")
+    }
+
+    func testKeepsProcessTitleWithSpaces() {
+        XCTAssertEqual(normalizeProcessName("next-server (v16.2.6)"), "next-server (v16.2.6)")
+    }
+
+    func testTrimsWhitespace() {
+        XCTAssertEqual(normalizeProcessName("  node "), "node")
+    }
+}
+
+// MARK: - Parse argv[0]
+
+final class ParseArgv0Tests: XCTestCase {
+    private func procArgs(argc: Int32, execPath: String, padding: Int = 5, strings: [String]) -> [UInt8] {
+        var bytes = withUnsafeBytes(of: argc) { Array($0) }
+        bytes += Array(execPath.utf8) + [0]
+        bytes += [UInt8](repeating: 0, count: padding)
+        for s in strings { bytes += Array(s.utf8) + [0] }
+        return bytes
+    }
+
+    private func parse(_ bytes: [UInt8]) -> String? {
+        bytes.withUnsafeBytes { parseArgv0(procArgs: $0) }
+    }
+
+    func testTypicalArgs() {
+        let bytes = procArgs(argc: 2, execPath: "/usr/local/bin/node", strings: ["node", "server.js", "PATH=/usr/bin"])
+        XCTAssertEqual(parse(bytes), "node")
+    }
+
+    func testProcessTitleDiffersFromExecPath() {
+        let bytes = procArgs(argc: 1, execPath: "/opt/homebrew/bin/node", strings: ["next-server (v16.2.6)"])
+        XCTAssertEqual(parse(bytes), "next-server (v16.2.6)")
+    }
+
+    func testNoPadding() {
+        let bytes = procArgs(argc: 1, execPath: "/bin/sleep", padding: 0, strings: ["sleep"])
+        XCTAssertEqual(parse(bytes), "sleep")
+    }
+
+    func testZeroArgcRejected() {
+        let bytes = procArgs(argc: 0, execPath: "/bin/sleep", strings: ["HOME=/Users/someone"])
+        XCTAssertNil(parse(bytes))
+    }
+
+    func testUnterminatedArgv0Rejected() {
+        let bytes = procArgs(argc: 1, execPath: "/bin/sleep", strings: ["sleep"]).dropLast()
+        XCTAssertNil(parse(Array(bytes)))
+    }
+
+    func testMissingArgv0Rejected() {
+        XCTAssertNil(parse(procArgs(argc: 1, execPath: "/bin/sleep", strings: [])))
+    }
+
+    func testTooShortRejected() {
+        XCTAssertNil(parse([]))
+        XCTAssertNil(parse([1, 0, 0]))
+    }
+}
+
+// MARK: - Running Processes
+
+final class RunningProcessesTests: XCTestCase {
+    func testFindsChildByArgv0() throws {
+        let marker = "stayawake-probe-\(UUID().uuidString.prefix(8).lowercased())"
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/bash")
+        task.arguments = ["-c", "exec -a \(marker) /bin/sleep 10"]
+        try task.run()
+        defer { task.terminate() }
+
+        let deadline = Date().addingTimeInterval(5)
+        var names = Set<String>()
+        while Date() < deadline {
+            names = try XCTUnwrap(getRunningProcesses())
+            if names.contains(marker) { break }
+            usleep(50_000)
+        }
+        XCTAssertTrue(names.contains(marker))
+    }
+
+    func testFallsBackToKernelNameForUnreadableArgs() throws {
+        let names = try XCTUnwrap(getRunningProcesses())
+        XCTAssertTrue(names.contains("launchd"))
     }
 }
 
@@ -262,12 +317,77 @@ final class ConfigTests: XCTestCase {
     }
 
     func testRoundTrip() throws {
-        let config = StayAwakeConfig(interval: 5, mode: .on, processes: ["node", "python"])
+        let config = StayAwakeConfig(interval: 5, mode: .on, processes: ["node", "python"], preventScreenLock: false)
         let data = try JSONEncoder().encode(config)
         let decoded = try JSONDecoder().decode(StayAwakeConfig.self, from: data)
         XCTAssertEqual(decoded.interval, 5)
         XCTAssertEqual(decoded.mode, .on)
         XCTAssertEqual(decoded.processes, ["node", "python"])
+        XCTAssertFalse(decoded.preventScreenLock)
+    }
+
+    func testDefaultPreventsScreenLock() {
+        XCTAssertTrue(StayAwakeConfig.default.preventScreenLock)
+    }
+
+    func testConfigWithoutPreventScreenLockStillDecodes() throws {
+        let data = Data(#"{"interval": 20, "mode": "off", "processes": ["node"]}"#.utf8)
+        let decoded = try JSONDecoder().decode(StayAwakeConfig.self, from: data)
+        XCTAssertEqual(decoded.interval, 20)
+        XCTAssertEqual(decoded.mode, .off)
+        XCTAssertEqual(decoded.processes, ["node"])
+        XCTAssertTrue(decoded.preventScreenLock)
+    }
+
+    func testMissingRequiredKeyStillFails() {
+        let data = Data(#"{"mode": "off", "processes": ["node"]}"#.utf8)
+        XCTAssertThrowsError(try JSONDecoder().decode(StayAwakeConfig.self, from: data))
+    }
+}
+
+// MARK: - Display Sleep Assertion
+
+final class DisplaySleepAssertionTests: XCTestCase {
+    private func ownAssertionTypes() -> [String] {
+        var byProcess: Unmanaged<CFDictionary>?
+        guard IOPMCopyAssertionsByProcess(&byProcess) == kIOReturnSuccess,
+              let all = byProcess?.takeRetainedValue() as? [NSNumber: [[String: Any]]] else { return [] }
+        return (all[NSNumber(value: getpid())] ?? []).compactMap { $0[kIOPMAssertionTypeKey] as? String }
+    }
+
+    private var holdsDisplayAssertion: Bool {
+        ownAssertionTypes().contains(kIOPMAssertionTypePreventUserIdleDisplaySleep)
+    }
+
+    func testActivateAndRelease() {
+        let assertion = DisplaySleepAssertion()
+        XCTAssertFalse(assertion.isActive)
+
+        assertion.setActive(true)
+        XCTAssertTrue(assertion.isActive)
+        XCTAssertTrue(holdsDisplayAssertion)
+
+        assertion.setActive(false)
+        XCTAssertFalse(assertion.isActive)
+        XCTAssertFalse(holdsDisplayAssertion)
+    }
+
+    func testRepeatedActivateHoldsSingleAssertion() {
+        let assertion = DisplaySleepAssertion()
+        assertion.setActive(true)
+        assertion.setActive(true)
+        XCTAssertEqual(ownAssertionTypes().filter { $0 == kIOPMAssertionTypePreventUserIdleDisplaySleep }.count, 1)
+        assertion.setActive(false)
+        XCTAssertFalse(holdsDisplayAssertion)
+    }
+
+    func testDeinitReleases() {
+        do {
+            let assertion = DisplaySleepAssertion()
+            assertion.setActive(true)
+            XCTAssertTrue(holdsDisplayAssertion)
+        }
+        XCTAssertFalse(holdsDisplayAssertion)
     }
 }
 

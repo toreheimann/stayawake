@@ -10,6 +10,8 @@ StayAwake polls your running processes every 10 seconds. If anything from its wa
 
 This means you can close your lid and walk away — your dev server, Docker containers, and long-running scripts keep going.
 
+While active, StayAwake also keeps the display awake so your Mac doesn't idle into the screen saver or lock screen. Toggle this with **Prevent Screen Lock** in the menu.
+
 ## Build
 
 Requires Xcode Command Line Tools (`xcode-select --install`).
@@ -24,7 +26,7 @@ Produces `dist/StayAwake.app` — a universal binary (Apple Silicon + Intel).
 
 ## Menu bar
 
-The sun icon appears in your menu bar — bright when preventing sleep, faded when idle. Click it for status, mode control, and settings.
+The sun icon appears in your menu bar — bright when preventing sleep, faded when idle. Click it for status, mode control, the screen lock toggle, and settings.
 
 ## Modes
 
@@ -38,7 +40,16 @@ Mode is persisted in settings — survives restarts.
 
 ## Settings
 
-Change the check interval, process watchlist, and launch-at-login via **Settings…** in the menu. Config saved to `~/.stayawake.json`.
+Change the check interval, process watchlist, and launch-at-login via **Settings…** in the menu. Config saved to `~/.stayawake.json`:
+
+```json
+{
+  "interval": 10,
+  "mode": "auto",
+  "preventScreenLock": true,
+  "processes": ["node", "python3", "claude"]
+}
+```
 
 ## Default watchlist
 
@@ -75,6 +86,7 @@ No manual toggling. No forgetting to turn it off. Sleep resumes the moment the a
 - Not signed or notarized — requires right-click > Open on first launch
 - Traps heat when lid is closed — do not put in a bag while awake
 - Process matching is by name — a hung process that hasn't exited will keep the Mac awake
+- Prevent Screen Lock only stops the *idle* lock — closing the lid, locking manually (⌃⌘Q), or a fast user switch still locks. It also keeps the display on, which costs battery
 
 ## License
 
