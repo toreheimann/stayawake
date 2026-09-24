@@ -361,28 +361,125 @@ final class ModeTests: XCTestCase {
     }
 }
 
-// MARK: - Wait For Acceptance
+// MARK: - Wait For Report
 
-final class WaitForAcceptanceTests: XCTestCase {
+final class WaitForReportTests: XCTestCase {
     func testSynchronousAcceptanceIsReported() {
-        XCTAssertTrue(waitForAcceptance(within: .seconds(2)) { accept in accept() })
+        XCTAssertTrue(waitForReport(within: .seconds(2)) { resolve in resolve(true) })
     }
 
     func testAsynchronousAcceptanceIsAwaited() {
         var acceptedBeforeReturning = false
-        let reported = waitForAcceptance(within: .seconds(2)) { accept in
+        let reported = waitForReport(within: .seconds(2)) { resolve in
             DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) {
                 acceptedBeforeReturning = true
-                accept()
+                resolve(true)
             }
         }
         XCTAssertTrue(reported)
         XCTAssertTrue(acceptedBeforeReturning, "a caller about to exit must not return before the work is taken")
     }
 
-    func testWorkThatIsNeverAcceptedTimesOut() {
-        XCTAssertFalse(waitForAcceptance(within: .milliseconds(50)) { _ in },
+    func testWorkThatIsNeverReportedTimesOut() {
+        XCTAssertFalse(waitForReport(within: .milliseconds(50)) { _ in },
                        "work that is never taken must fall through to the caller's fallback")
+    }
+
+    func testRefusalIsReported() {
+        XCTAssertFalse(waitForReport(within: .seconds(2)) { resolve in resolve(false) })
+    }
+
+    func testRefusalDoesNotBurnTheBudget() {
+        let started = Date()
+        _ = waitForReport(within: .seconds(2)) { resolve in resolve(false) }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5,
+                          "a channel that has already refused must not hold an exiting process to its deadline")
+    }
+}
+
+// MARK: - Submit Notification Report
+
+final class SubmitNotificationReportTests: XCTestCase {
+    private func makeRequest() -> UNNotificationRequest {
+        UNNotificationRequest(identifier: "test", content: UNMutableNotificationContent(), trigger: nil)
+    }
+
+    /// - Returns: whether the report was reported as presentable, and whether it reached `add` at all.
+    private func submit(status: UNAuthorizationStatus,
+                        alertSetting: UNNotificationSetting,
+                        addError: Error? = nil) -> (presented: Bool?, reachedAdd: Bool) {
+        var presented: Bool?
+        var reachedAdd = false
+        submitNotificationReport(
+            makeRequest(),
+            fetchSettings: { yield in yield(status, alertSetting) },
+            add: { _, done in
+                reachedAdd = true
+                done(addError)
+            },
+            completion: { presented = $0 }
+        )
+        return (presented, reachedAdd)
+    }
+
+    func testPresentableAndAcceptedReportsSuccess() {
+        let result = submit(status: .authorized, alertSetting: .enabled)
+        XCTAssertEqual(result.presented, true)
+        XCTAssertTrue(result.reachedAdd)
+    }
+
+    func testAlertsTurnedOffAfterLaunchReportsFailureAndSubmitsNothing() {
+        let result = submit(status: .authorized, alertSetting: .disabled)
+        XCTAssertEqual(result.presented, false, "acceptance by a channel that will not present is not a report")
+        XCTAssertFalse(result.reachedAdd, "nothing is handed to a channel the live settings say cannot present it")
+    }
+
+    func testAuthorizationRevokedAfterLaunchReportsFailure() {
+        let result = submit(status: .denied, alertSetting: .enabled)
+        XCTAssertEqual(result.presented, false, "permission granted at launch can be revoked before the report")
+        XCTAssertFalse(result.reachedAdd)
+    }
+
+    func testRefusedRequestReportsFailure() {
+        let result = submit(status: .authorized, alertSetting: .enabled,
+                            addError: NSError(domain: "test", code: 1))
+        XCTAssertEqual(result.presented, false)
+    }
+}
+
+// MARK: - Retry Unfinished Sleep Restore
+
+final class RetryUnfinishedSleepRestoreTests: XCTestCase {
+    func testNoRecordSkipsTheRetry() {
+        var attempted = false
+        let owed = retryUnfinishedSleepRestore(saved: nil) { _ in
+            attempted = true
+            return true
+        }
+        XCTAssertNil(owed)
+        XCTAssertFalse(attempted)
+    }
+
+    func testSuccessfulRetryOwesNothing() {
+        XCTAssertNil(retryUnfinishedSleepRestore(saved: 10) { _ in true })
+    }
+
+    func testFailedRetryStillOwesTheSavedValue() {
+        XCTAssertEqual(retryUnfinishedSleepRestore(saved: 10) { _ in false }, 10,
+                       "a retry that could not hand the setting back must not look like one that did")
+    }
+
+    func testRetryIsGivenTheClampedValue() {
+        var target: Int?
+        _ = retryUnfinishedSleepRestore(saved: 999) { value in
+            target = value
+            return true
+        }
+        XCTAssertEqual(target, 180)
+    }
+
+    func testFailedRetryOwesTheClampedValue() {
+        XCTAssertEqual(retryUnfinishedSleepRestore(saved: 0) { _ in false }, 1)
     }
 }
 

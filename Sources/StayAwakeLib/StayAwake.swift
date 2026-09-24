@@ -7,6 +7,9 @@ let PMSET = "/usr/bin/pmset"
 let CONFIG_PATH = NSString("~/.stayawake.json").expandingTildeInPath
 let MAX_CONFIG_SIZE: UInt64 = 1_048_576
 let CLEANUP_FAILURE_REMEDY = "The Mac is still set not to sleep. Run `sudo pmset -a disablesleep 0` in Terminal, or launch StayAwake again to restore it."
+/// The remedy for the launch that was supposed to be the remedy: it drops the "launch again" half of
+/// ``CLEANUP_FAILURE_REMEDY``, which is the advice that just failed.
+let RELAUNCH_RESTORE_FAILURE_REMEDY = "A previous quit left the Mac set not to sleep, and this launch could not hand the setting back either. Run `sudo pmset -a disablesleep 0` in Terminal, and check that StayAwake still has permission to run pmset."
 /// How long an exiting process waits for a cleanup-failure report to be taken before falling back to a modal.
 /// The callers exit on their next statement, so the wait has to be bounded.
 let CLEANUP_REPORT_TIMEOUT: DispatchTimeInterval = .seconds(2)
@@ -197,6 +200,20 @@ func clampSleepValue(_ value: Int) -> Int {
     max(1, min(value, 180))
 }
 
+/// Retries the sleep restore that a previous run's cleanup recorded as unfinished.
+///
+/// - Parameters:
+///   - saved: the value the previous run recorded, or `nil` when it left no record.
+///   - restore: hands the clamped value back to the Mac; returns whether it took.
+/// - Returns: the value the Mac is still owed, or `nil` when there was nothing to restore or the retry succeeded.
+///   A non-nil return means the machine still carries the forced-awake setting this app left there, so the value
+///   read back from it is this app's own pollution and must never be adopted as the new original.
+func retryUnfinishedSleepRestore(saved: Int?, restore: (Int) -> Bool) -> Int? {
+    guard let saved else { return nil }
+    let target = clampSleepValue(saved)
+    return restore(target) ? nil : target
+}
+
 @discardableResult
 func setSleepPrevention(enabled: Bool, restoreSleep: Int = 1) -> Bool {
     let val = enabled ? "1" : "0"
@@ -283,18 +300,52 @@ private func runProcess(_ path: String, args: [String]) -> Bool {
 
 // MARK: - Exit Reporting
 
-/// Blocks until asynchronous work reports that it was accepted, so a caller about to exit does not die before the
-/// work it asked for has been taken.
+/// Blocks until asynchronous work reports back, so a caller about to exit does not die before the work it asked for
+/// has been taken.
 ///
-/// Only acceptance is signalled: a submission that fails times out into the caller's fallback rather than needing a
-/// second channel to carry an error back across the wait.
+/// A refusal is an answer and returns immediately. Waiting out `timeout` on a channel that has already said no
+/// spends the exit window the caller's fallback still needs.
 ///
-/// - Parameter submit: receives a callback to invoke once, and only if the work was accepted.
-/// - Returns: whether acceptance arrived inside `timeout`.
-func waitForAcceptance(within timeout: DispatchTimeInterval, _ submit: (@escaping () -> Void) -> Void) -> Bool {
-    let accepted = DispatchSemaphore(value: 0)
-    submit { accepted.signal() }
-    return accepted.wait(timeout: .now() + timeout) == .success
+/// - Parameters:
+///   - submit: receives a callback to invoke exactly once, with whether the work was accepted.
+/// - Returns: whether the work was accepted. `false` covers both a reported refusal and `timeout` elapsing — the
+///   caller falls back either way, it just reaches the fallback sooner in the first case.
+func waitForReport(within timeout: DispatchTimeInterval, _ submit: (@escaping (Bool) -> Void) -> Void) -> Bool {
+    let resolved = DispatchSemaphore(value: 0)
+    var accepted = false
+    submit { taken in
+        accepted = taken
+        resolved.signal()
+    }
+    // Reading `accepted` only after a successful wait is what orders the write on the reporting thread against
+    // this read; on the timeout path it is never read.
+    guard resolved.wait(timeout: .now() + timeout) == .success else { return false }
+    return accepted
+}
+
+/// Submits a report to the notification centre and reports whether it will actually reach the user.
+///
+/// Two things have to hold and neither is knowable at launch: the live settings must say a notification would be
+/// presented, and the centre must take the request. Whichever fails, the caller is told so it can fall back —
+/// never left to infer a refusal from silence.
+///
+/// - Parameters:
+///   - fetchSettings: yields the live authorization status and alert setting.
+///   - add: submits the request, yielding the centre's error when it refused.
+///   - completion: receives whether the report will be presented. Called exactly once.
+func submitNotificationReport(
+    _ request: UNNotificationRequest,
+    fetchSettings: (@escaping (UNAuthorizationStatus, UNNotificationSetting) -> Void) -> Void,
+    add: @escaping (UNNotificationRequest, @escaping (Error?) -> Void) -> Void,
+    completion: @escaping (Bool) -> Void
+) {
+    fetchSettings { authorizationStatus, alertSetting in
+        guard notificationCanPresent(authorizationStatus: authorizationStatus, alertSetting: alertSetting) else {
+            completion(false)
+            return
+        }
+        add(request) { error in completion(error == nil) }
+    }
 }
 
 /// Whether a report submitted now would be presented, rather than merely accepted.
@@ -326,7 +377,6 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var iconActive: NSImage?
     private var iconInactive: NSImage?
     private var signalSources: [DispatchSourceSignal] = []
-    private var notificationsAllowed = false
 
     /// Serial, so `cleanup`'s disable is ordered after any pmset call already in flight instead of racing it.
     private let sleepQueue = DispatchQueue(label: "com.signifly.stayawake.sleep")
@@ -339,21 +389,23 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { [weak self] granted, _ in
-            DispatchQueue.main.async { self?.notificationsAllowed = granted }
-        }
+        // The grant is not recorded: it can be withdrawn afterwards, so every reporter re-reads the live settings
+        // at the point it reports rather than trusting an answer from launch.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
 
         loadIcons()
         migrateConfigIfNeeded()
         let load = loadConfig()
         config = load.config
 
-        if let saved = UserDefaults.standard.object(forKey: "originalSleep") as? Int {
-            setSleepPrevention(enabled: false, restoreSleep: clampSleepValue(saved))
-            UserDefaults.standard.removeObject(forKey: "originalSleep")
+        let savedSleep = UserDefaults.standard.object(forKey: "originalSleep") as? Int
+        let stillOwed = retryUnfinishedSleepRestore(saved: savedSleep) {
+            setSleepPrevention(enabled: false, restoreSleep: $0)
         }
-
-        originalSleep = getSleepValue() ?? 1
+        // Only a retry that succeeded may hand the record over to the machine. While the Mac still carries this
+        // app's forced-awake setting, reading it back would store that as the original and every later cleanup
+        // would then "restore" the Mac to never sleeping.
+        originalSleep = stillOwed ?? getSleepValue() ?? 1
         UserDefaults.standard.set(originalSleep, forKey: "originalSleep")
 
         setupStatusBar()
@@ -367,6 +419,10 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 : "StayAwake will not write through a symlink or directory — move or delete \(CONFIG_PATH) to use the menu's settings."
             let state = config.mode == .on ? "Keep Awake stays on." : "Starting with Keep Awake off."
             showFailureAlert("StayAwake could not read its settings", "\(reason)\n\n\(state) \(remedy)")
+        }
+
+        if stillOwed != nil {
+            showFailureAlert("StayAwake could not restore sleep settings", RELAUNCH_RESTORE_FAILURE_REMEDY)
         }
 
         if !checkSudoers() {
@@ -562,23 +618,34 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reportSleepControlFailure()
     }
 
-    /// Notifications can be denied without telling the app, so an undelivered notification falls back to an alert.
+    /// Binds ``submitNotificationReport(_:fetchSettings:add:completion:)`` to the real notification centre.
+    private func submitLiveNotificationReport(_ request: UNNotificationRequest,
+                                              completion: @escaping (Bool) -> Void) {
+        let center = UNUserNotificationCenter.current()
+        submitNotificationReport(
+            request,
+            fetchSettings: { yield in
+                center.getNotificationSettings { yield($0.authorizationStatus, $0.alertSetting) }
+            },
+            add: { request, done in center.add(request, withCompletionHandler: done) },
+            completion: completion
+        )
+    }
+
+    /// Notifications can be switched off after launch, and acceptance by the centre is not delivery. Anything
+    /// short of a report the live settings say will be presented falls back to an alert. Nothing here is exiting,
+    /// so the check needs no bounded wait.
     private func reportSleepControlFailure() {
         let title = "StayAwake could not change sleep settings"
         let body = "Sleep control failed. Check that StayAwake still has permission to run pmset."
-
-        guard notificationsAllowed else {
-            showFailureAlert(title, body)
-            return
-        }
 
         let content = UNMutableNotificationContent()
         content.title = "StayAwake"
         content.subtitle = "Sleep control failed"
         content.body = body
         let request = UNNotificationRequest(identifier: "sleep-failed", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request) { [weak self] error in
-            guard error != nil else { return }
+        submitLiveNotificationReport(request) { [weak self] presented in
+            guard !presented else { return }
             DispatchQueue.main.async { self?.showFailureAlert(title, body) }
         }
     }
@@ -587,6 +654,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// The only failure channel this app has: it is an LSUIElement, so stderr reaches nobody.
     private func showFailureAlert(_ messageText: String, _ informativeText: String) {
+        activateForAlert()
         failureAlert(messageText, informativeText).runModal()
     }
 
@@ -594,12 +662,20 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// process. `runModal` returns only when a human clicks, which is a wait an unattended exit cannot make.
     private func showFailureAlert(_ messageText: String, _ informativeText: String,
                                   dismissingAfter timeout: TimeInterval) {
+        activateForAlert()
         let alert = failureAlert(messageText, informativeText)
         // Scheduled in `.modalPanel` so it still fires once the alert has taken over the run loop.
         let dismiss = Timer(timeInterval: timeout, repeats: false) { _ in NSApp.abortModal() }
         RunLoop.main.add(dismiss, forMode: .modalPanel)
         alert.runModal()
         dismiss.invalidate()
+    }
+
+    /// Puts the alert in front of the frontmost app's windows. Without this the modal opens behind them: a report
+    /// the user never sees is the same silence as not reporting, and the bounded variant takes itself back down,
+    /// so being found later is not an option either.
+    private func activateForAlert() {
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func failureAlert(_ messageText: String, _ informativeText: String) -> NSAlert {
@@ -666,7 +742,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ///
     /// A notification is preferred — there is no window left to put a modal on — but only once the live settings say
     /// it would be presented, so the report is not handed to a channel the user has since switched off. Anything
-    /// else, including a request that is not taken in time, falls through to the alert, which cannot be suppressed.
+    /// else — a refusal, or a request not taken in time — falls through to the alert, which notification settings
+    /// cannot suppress, though it is time-bounded and so can still go unread.
     private func reportCleanupFailure() {
         let title = "StayAwake could not restore sleep settings"
 
@@ -676,16 +753,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         content.body = CLEANUP_FAILURE_REMEDY
         let request = UNNotificationRequest(identifier: "cleanup-failed", content: content, trigger: nil)
 
-        let center = UNUserNotificationCenter.current()
-        let reported = waitForAcceptance(within: CLEANUP_REPORT_TIMEOUT) { accept in
-            center.getNotificationSettings { settings in
-                guard notificationCanPresent(authorizationStatus: settings.authorizationStatus,
-                                             alertSetting: settings.alertSetting) else { return }
-                center.add(request) { error in
-                    guard error == nil else { return }
-                    accept()
-                }
-            }
+        let reported = waitForReport(within: CLEANUP_REPORT_TIMEOUT) { resolve in
+            submitLiveNotificationReport(request, completion: resolve)
         }
         if !reported {
             showFailureAlert(title, CLEANUP_FAILURE_REMEDY, dismissingAfter: CLEANUP_ALERT_TIMEOUT)
