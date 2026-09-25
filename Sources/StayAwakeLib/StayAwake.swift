@@ -309,6 +309,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let load = loadConfig()
         config = load.config
 
+        // Before the restore retry: it runs pmset through the sudoers rule this may install.
+        if !checkSudoers() {
+            requestPermissions()
+        }
+
         let savedSleep = UserDefaults.standard.object(forKey: "originalSleep") as? Int
         let stillOwed = retryUnfinishedSleepRestore(saved: savedSleep) {
             setSleepPrevention(enabled: false, restoreSleep: $0)
@@ -331,10 +336,6 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if stillOwed != nil {
             showFailureAlert("StayAwake could not restore sleep settings", RELAUNCH_RESTORE_FAILURE_REMEDY)
-        }
-
-        if !checkSudoers() {
-            requestPermissions()
         }
 
         for sig in [SIGTERM, SIGINT] {
@@ -564,8 +565,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Cleanup
 
-    /// - Returns: whether the Mac was handed back its sleep settings. A `false` return leaves `originalSleep` in
-    ///   place so the next launch retries. A repeat call returns `true`: the first one owns reporting.
+    /// - Returns: whether the Mac got its sleep settings back. `false` leaves `originalSleep` in place so the next
+    ///   launch retries. Repeat calls return `true`.
     @discardableResult
     private func cleanup() -> Bool {
         let shouldRun = cleanupQueue.sync { () -> Bool in
