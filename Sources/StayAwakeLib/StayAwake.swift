@@ -6,7 +6,7 @@ let PMSET = "/usr/bin/pmset"
 let CONFIG_PATH = NSString("~/.stayawake.json").expandingTildeInPath
 let MAX_CONFIG_SIZE: UInt64 = 1_048_576
 let CLEANUP_FAILURE_REMEDY = "The Mac is still set not to sleep. Run `sudo pmset -a disablesleep 0` in Terminal, or launch StayAwake again to restore it."
-let RELAUNCH_RESTORE_FAILURE_REMEDY = "A previous quit left the Mac set not to sleep, and this launch could not hand the setting back either. Run `sudo pmset -a disablesleep 0` in Terminal, and check that StayAwake still has permission to run pmset."
+let RELAUNCH_RESTORE_FAILURE_REMEDY = "StayAwake couldn't confirm your sleep settings were restored after its last run. Run `sudo pmset -a disablesleep 0` in Terminal to make sure the Mac can sleep."
 
 var appVersion: String {
     Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -309,6 +309,9 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let load = loadConfig()
         config = load.config
 
+        setupStatusBar()
+        setupMenu()
+
         // Before the restore retry: it runs pmset through the sudoers rule this may install.
         if !checkSudoers() {
             requestPermissions()
@@ -322,9 +325,6 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // later cleanup "restore" the Mac to never sleeping.
         originalSleep = stillOwed ?? getSleepValue() ?? 1
         UserDefaults.standard.set(originalSleep, forKey: "originalSleep")
-
-        setupStatusBar()
-        setupMenu()
 
         if let reason = load.rejectionReason {
             let remedy = isPathSafeToAccess(CONFIG_PATH)
@@ -540,6 +540,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Permissions
 
     private func requestPermissions() {
+        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "StayAwake needs permission"
         alert.informativeText = "One-time admin access is needed to control sleep without a password prompt each time. Click Grant Access to proceed."
