@@ -310,12 +310,14 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         config = load.config
 
         let savedSleep = UserDefaults.standard.object(forKey: "originalSleep") as? Int
-        // Provisional until the retry below, so a quit during the permission prompt restores the recorded value
-        // rather than a placeholder.
+        // Read once, before this run can touch pmset. A restore retry either returns the Mac to the saved value or
+        // still owes it, so the saved value stays the original either way.
         originalSleep = savedSleep.map(clampSleepValue) ?? getSleepValue() ?? 1
+        UserDefaults.standard.set(originalSleep, forKey: "originalSleep")
 
+        // Icon now, so the launch is visible behind the permission prompt. The menu waits until the retry has run,
+        // so nothing can toggle sleep before then.
         setupStatusBar()
-        setupMenu()
 
         // Before the restore retry: it runs pmset through the sudoers rule this may install.
         if !checkSudoers() {
@@ -325,10 +327,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let stillOwed = retryUnfinishedSleepRestore(saved: savedSleep) {
             setSleepPrevention(enabled: false, restoreSleep: $0)
         }
-        // While a restore is still owed, the Mac's sleep value is this app's own; recording it would make every
-        // later cleanup "restore" the Mac to never sleeping.
-        originalSleep = stillOwed ?? getSleepValue() ?? 1
-        UserDefaults.standard.set(originalSleep, forKey: "originalSleep")
+
+        setupMenu()
 
         if let reason = load.rejectionReason {
             let remedy = isPathSafeToAccess(CONFIG_PATH)
