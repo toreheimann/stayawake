@@ -1,152 +1,6 @@
+import IOKit.pwr_mgt
 import XCTest
 @testable import StayAwakeLib
-
-// MARK: - Process Name Matching
-
-final class ProcessNameMatchesTests: XCTestCase {
-    func testExactMatch() {
-        XCTAssertTrue(processNameMatches("node", key: "node"))
-    }
-
-    func testPrefixWithDigit() {
-        XCTAssertTrue(processNameMatches("python3.11", key: "python"))
-    }
-
-    func testPrefixWithHyphen() {
-        XCTAssertTrue(processNameMatches("docker-compose", key: "docker"))
-    }
-
-    func testPrefixWithDot() {
-        XCTAssertTrue(processNameMatches("node.js", key: "node"))
-    }
-
-    func testPrefixWithUnderscore() {
-        XCTAssertTrue(processNameMatches("python3_test", key: "python3"))
-    }
-
-    func testRejectsLetterContinuation() {
-        XCTAssertFalse(processNameMatches("google_crashpad_handler", key: "go"))
-    }
-
-    func testRejectsSubstringInMiddle() {
-        XCTAssertFalse(processNameMatches("mongod", key: "go"))
-    }
-
-    func testRejectsNoPrefix() {
-        XCTAssertFalse(processNameMatches("parentnode", key: "node"))
-    }
-
-    func testJavaDoesNotMatchJavascript() {
-        XCTAssertFalse(processNameMatches("javascript", key: "java"))
-    }
-}
-
-// MARK: - Find Matches
-
-final class FindMatchesTests: XCTestCase {
-    func testBasicMatch() {
-        let running: Set<String> = ["node", "vim", "zsh"]
-        let matches = findMatches(watched: ["node", "python"], running: running)
-        XCTAssertEqual(matches, ["node"])
-    }
-
-    func testCaseInsensitive() {
-        let running: Set<String> = ["node", "python3"]
-        let matches = findMatches(watched: ["Node", "Python3"], running: running)
-        XCTAssertEqual(matches, ["Node", "Python3"])
-    }
-
-    func testDeduplication() {
-        let running: Set<String> = ["node"]
-        let matches = findMatches(watched: ["node", "Node", "NODE"], running: running)
-        XCTAssertEqual(matches, ["node"])
-    }
-
-    func testEmptyWatched() {
-        XCTAssertEqual(findMatches(watched: [], running: ["node"]), [])
-    }
-
-    func testEmptyRunning() {
-        XCTAssertEqual(findMatches(watched: ["node"], running: []), [])
-    }
-
-    func testPartialMatch() {
-        let running: Set<String> = ["python3.11"]
-        let matches = findMatches(watched: ["python"], running: running)
-        XCTAssertEqual(matches, ["python"])
-    }
-
-    func testPreservesWatchedOrder() {
-        let running: Set<String> = ["redis", "node", "docker"]
-        let matches = findMatches(watched: ["docker", "node", "redis"], running: running)
-        XCTAssertEqual(matches, ["docker", "node", "redis"])
-    }
-
-    func testNoFalsePositives() {
-        let running: Set<String> = ["vim", "zsh", "finder"]
-        let matches = findMatches(watched: ["node", "python", "docker"], running: running)
-        XCTAssertTrue(matches.isEmpty)
-    }
-
-    func testNoSubstringFalsePositive() {
-        let running: Set<String> = ["google_crashpad_handler", "mongod"]
-        let matches = findMatches(watched: ["go"], running: running)
-        XCTAssertTrue(matches.isEmpty)
-    }
-
-    func testPrefixMatchWithSeparator() {
-        let running: Set<String> = ["docker-compose"]
-        let matches = findMatches(watched: ["docker"], running: running)
-        XCTAssertEqual(matches, ["docker"])
-    }
-}
-
-// MARK: - Parse Process List
-
-final class ParseProcessListTests: XCTestCase {
-    func testBasicParsing() {
-        let output = "  PID COMM\n  123 /usr/local/bin/node\n  456 /usr/bin/vim"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertEqual(procs, ["node", "vim"])
-    }
-
-    func testExtractsBasename() {
-        let output = "  PID COMM\n  100 /usr/local/bin/python3.11"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertTrue(procs.contains("python3.11"))
-    }
-
-    func testLowercases() {
-        let output = "  PID COMM\n  100 /usr/local/bin/Docker"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertTrue(procs.contains("docker"))
-    }
-
-    func testSkipsHeaderLine() {
-        let output = "  PID COMM\n  123 node"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertEqual(procs.count, 1)
-        XCTAssertTrue(procs.contains("node"))
-    }
-
-    func testExcludesPid() {
-        let output = "  100 node\n  200 vim"
-        let procs = parseProcessList(output, excludingPid: 100)
-        XCTAssertFalse(procs.contains("node"))
-        XCTAssertTrue(procs.contains("vim"))
-    }
-
-    func testEmptyOutput() {
-        let procs = parseProcessList("", excludingPid: 0)
-        XCTAssertTrue(procs.isEmpty)
-    }
-
-    func testBareProcessName() {
-        let output = "  100 node"
-        let procs = parseProcessList(output, excludingPid: 0)
-        XCTAssertTrue(procs.contains("node"))
-    }
-}
 
 // MARK: - Parse Sleep Value
 
@@ -189,95 +43,288 @@ final class ParseSleepValueTests: XCTestCase {
     }
 }
 
-// MARK: - Config Validation
-
-final class ValidateConfigTests: XCTestCase {
-    func testValidConfigUnchanged() {
-        let config = StayAwakeConfig(interval: 5, mode: .on, processes: ["node"])
-        let result = validateConfig(config)
-        XCTAssertEqual(result.interval, 5)
-        XCTAssertEqual(result.mode, .on)
-        XCTAssertEqual(result.processes, ["node"])
-    }
-
-    func testZeroIntervalResetToDefault() {
-        let config = StayAwakeConfig(interval: 0, mode: .auto, processes: ["node"])
-        XCTAssertEqual(validateConfig(config).interval, 10)
-    }
-
-    func testNegativeIntervalResetToDefault() {
-        let config = StayAwakeConfig(interval: -5, mode: .auto, processes: ["node"])
-        XCTAssertEqual(validateConfig(config).interval, 10)
-    }
-
-    func testIntervalAboveMaxResetToDefault() {
-        let config = StayAwakeConfig(interval: 999, mode: .auto, processes: ["node"])
-        XCTAssertEqual(validateConfig(config).interval, 10)
-    }
-
-    func testIntervalAtMaxBoundary() {
-        let config = StayAwakeConfig(interval: 300, mode: .auto, processes: ["node"])
-        XCTAssertEqual(validateConfig(config).interval, 300)
-    }
-
-    func testIntervalJustAboveMax() {
-        let config = StayAwakeConfig(interval: 301, mode: .auto, processes: ["node"])
-        XCTAssertEqual(validateConfig(config).interval, 10)
-    }
-
-    func testEmptyProcessesFilteredOut() {
-        let config = StayAwakeConfig(interval: 10, mode: .auto, processes: ["node", "", "python"])
-        let result = validateConfig(config)
-        XCTAssertEqual(result.processes, ["node", "python"])
-    }
-
-    func testAllEmptyProcessesFallsBackToDefault() {
-        let config = StayAwakeConfig(interval: 10, mode: .auto, processes: ["", ""])
-        let result = validateConfig(config)
-        XCTAssertEqual(result.processes, DEFAULT_PROCESSES)
-    }
-
-    func testEmptyProcessListFallsBackToDefault() {
-        let config = StayAwakeConfig(interval: 10, mode: .auto, processes: [])
-        let result = validateConfig(config)
-        XCTAssertEqual(result.processes, DEFAULT_PROCESSES)
-    }
-}
-
 // MARK: - Config Serialization
 
 final class ConfigTests: XCTestCase {
-    func testDefaultValues() {
-        let config = StayAwakeConfig.default
-        XCTAssertEqual(config.interval, 10)
-        XCTAssertEqual(config.mode, .auto)
-        XCTAssertFalse(config.processes.isEmpty)
+    private func decode(_ json: String) throws -> StayAwakeConfig {
+        try JSONDecoder().decode(StayAwakeConfig.self, from: Data(json.utf8))
     }
 
-    func testDefaultProcessesContainCommonTools() {
-        XCTAssertTrue(DEFAULT_PROCESSES.contains("node"))
-        XCTAssertTrue(DEFAULT_PROCESSES.contains("docker"))
-        XCTAssertTrue(DEFAULT_PROCESSES.contains("python3"))
-        XCTAssertTrue(DEFAULT_PROCESSES.contains("claude"))
+    func testDefaultValues() {
+        let config = StayAwakeConfig.default
+        XCTAssertEqual(config.mode, .on)
+        XCTAssertTrue(config.preventScreenLock)
     }
 
     func testRoundTrip() throws {
-        let config = StayAwakeConfig(interval: 5, mode: .on, processes: ["node", "python"])
-        let data = try JSONEncoder().encode(config)
-        let decoded = try JSONDecoder().decode(StayAwakeConfig.self, from: data)
-        XCTAssertEqual(decoded.interval, 5)
+        let config = StayAwakeConfig(mode: .off, preventScreenLock: false)
+        let decoded = try JSONDecoder().decode(StayAwakeConfig.self, from: JSONEncoder().encode(config))
+        XCTAssertEqual(decoded.mode, .off)
+        XCTAssertFalse(decoded.preventScreenLock)
+    }
+
+    func testEmptyObjectUsesDefaults() throws {
+        let decoded = try decode("{}")
         XCTAssertEqual(decoded.mode, .on)
-        XCTAssertEqual(decoded.processes, ["node", "python"])
+        XCTAssertTrue(decoded.preventScreenLock)
+        XCTAssertTrue(decoded.malformedKeys.isEmpty, "an absent key is not a malformed key")
+    }
+
+    func testLegacyAutoConfigLoadsAsOn() throws {
+        let decoded = try decode(#"{"interval": 20, "mode": "auto", "processes": ["node"]}"#)
+        XCTAssertEqual(decoded.mode, .on)
+        XCTAssertTrue(decoded.preventScreenLock)
+    }
+
+    func testLegacyOffConfigStaysOff() throws {
+        let decoded = try decode(#"{"interval": 20, "mode": "off", "processes": ["node"]}"#)
+        XCTAssertEqual(decoded.mode, .off)
+    }
+
+    func testEncodingDropsLegacyKeys() throws {
+        let legacy = try decode(#"{"interval": 20, "mode": "off", "processes": ["node"]}"#)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any])
+        XCTAssertEqual(Set(json.keys), ["mode", "preventScreenLock"])
+    }
+
+    func testWrongTypedPreventScreenLockFallsBackToSafeValue() throws {
+        let decoded = try decode(#"{"preventScreenLock": "yes"}"#)
+        XCTAssertFalse(decoded.preventScreenLock, "a value we could not read must not turn screen-lock prevention on")
+        XCTAssertEqual(decoded.mode, .on, "an absent key still uses the default")
+        XCTAssertEqual(decoded.malformedKeys, ["preventScreenLock"])
+    }
+
+    func testMalformedKeyDoesNotDiscardTheRest() throws {
+        let decoded = try decode(#"{"mode": "off", "preventScreenLock": "yes"}"#)
+        XCTAssertEqual(decoded.mode, .off)
+        XCTAssertFalse(decoded.preventScreenLock)
+        XCTAssertEqual(decoded.malformedKeys, ["preventScreenLock"])
+    }
+
+    func testMalformedModeFallsBackToSafeValueAndKeepsTheRest() throws {
+        let decoded = try decode(#"{"mode": 5, "preventScreenLock": false}"#)
+        XCTAssertEqual(decoded.mode, .off, "a mode we could not read must not force the Mac awake")
+        XCTAssertFalse(decoded.preventScreenLock)
+        XCTAssertEqual(decoded.malformedKeys, ["mode"])
+    }
+
+    func testNullModeFallsBackToSafeValue() throws {
+        let decoded = try decode(#"{"mode": null, "preventScreenLock": false}"#)
+        XCTAssertEqual(decoded.mode, .off)
+        XCTAssertEqual(decoded.malformedKeys, ["mode"])
+    }
+
+    func testUnrecognizedModeStringFallsBackToSafeValueAndIsReported() throws {
+        let decoded = try decode(#"{"mode": "On", "preventScreenLock": false}"#)
+        XCTAssertEqual(decoded.mode, .off, "a mode we could not read must not force the Mac awake")
+        XCTAssertEqual(decoded.malformedKeys, ["mode"],
+                       "an unreadable value is named whatever JSON type it arrived as")
+    }
+
+    func testEveryMalformedKeyIsReported() throws {
+        let decoded = try decode(#"{"mode": 5, "preventScreenLock": "yes"}"#)
+        XCTAssertEqual(decoded.mode, .off)
+        XCTAssertFalse(decoded.preventScreenLock)
+        XCTAssertEqual(decoded.malformedKeys, ["mode", "preventScreenLock"])
+    }
+
+    func testMalformedKeysAreNotEncoded() throws {
+        let decoded = try decode(#"{"mode": 5}"#)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any])
+        XCTAssertEqual(Set(json.keys), ["mode", "preventScreenLock"])
+    }
+}
+
+// MARK: - Load Config
+
+final class LoadConfigTests: XCTestCase {
+    private var path = ""
+
+    override func setUp() {
+        super.setUp()
+        path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(atPath: path)
+        super.tearDown()
+    }
+
+    private func write(_ contents: String) throws {
+        try contents.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    func testMissingFileUsesDefaults() {
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, StayAwakeConfig.default.mode)
+        XCTAssertNil(result.rejectionReason)
+    }
+
+    func testValidFileLoads() throws {
+        try write(#"{"mode": "off", "preventScreenLock": false}"#)
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertFalse(result.config.preventScreenLock)
+        XCTAssertNil(result.rejectionReason)
+    }
+
+    func testMalformedJSONFallsBackToSafeStateAndReportsWhy() throws {
+        try write("{ this is not json")
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off, "an unreadable config must not mean \"force the Mac awake\"")
+        XCTAssertFalse(result.config.preventScreenLock)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testNonObjectJSONFallsBackToSafeState() throws {
+        try write("[1, 2, 3]")
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testSymlinkFallsBackToSafeState() throws {
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try #"{"mode": "on"}"#.write(to: target, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: target.path)
+        defer { try? FileManager.default.removeItem(at: target) }
+
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testOversizedFileFallsBackToSafeState() throws {
+        try write(String(repeating: " ", count: Int(MAX_CONFIG_SIZE) + 1))
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testWrongTypedModeFallsBackToSafeStateAndReportsWhy() throws {
+        try write(#"{"mode": 5, "preventScreenLock": false}"#)
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off, "a value we could not read must not mean \"force the Mac awake\"")
+        XCTAssertNotNil(result.rejectionReason, "a key we could not read must reach the launch alert")
+    }
+
+    func testWrongTypedPreventScreenLockReportsWhyAndKeepsTheReadableKey() throws {
+        try write(#"{"mode": "on", "preventScreenLock": "yes"}"#)
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .on, "a readable key survives a malformed sibling")
+        XCTAssertFalse(result.config.preventScreenLock)
+        XCTAssertNotNil(result.rejectionReason)
+    }
+
+    func testUnrecognizedModeStringReportsWhy() throws {
+        try write(#"{"mode": "On", "preventScreenLock": false}"#)
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertNotNil(result.rejectionReason, "a key we could not read must reach the launch alert")
+    }
+
+    func testRejectionReasonNamesTheMalformedKeys() throws {
+        try write(#"{"mode": 5, "preventScreenLock": "yes"}"#)
+        let reason = try XCTUnwrap(loadConfig(path: path).rejectionReason)
+        XCTAssertTrue(reason.contains("mode"))
+        XCTAssertTrue(reason.contains("preventScreenLock"))
+    }
+}
+
+// MARK: - Save Config
+
+final class SaveConfigTests: XCTestCase {
+    private var path = ""
+
+    override func setUp() {
+        super.setUp()
+        path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(atPath: path)
+        super.tearDown()
+    }
+
+    func testWritesRegularFileAndReportsSuccess() throws {
+        XCTAssertTrue(saveConfig(StayAwakeConfig(mode: .off, preventScreenLock: false), path: path))
+        let result = loadConfig(path: path)
+        XCTAssertEqual(result.config.mode, .off)
+        XCTAssertFalse(result.config.preventScreenLock)
+        let perms = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(perms.int16Value, 0o600)
+    }
+
+    func testRefusesSymlinkAndReportsFailure() throws {
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try #"{"mode": "on"}"#.write(to: target, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: target.path)
+        defer { try? FileManager.default.removeItem(at: target) }
+
+        XCTAssertFalse(saveConfig(StayAwakeConfig(mode: .off, preventScreenLock: false), path: path),
+                       "a save that never wrote must not report success")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), #"{"mode": "on"}"#)
+    }
+
+    func testRefusesDirectoryAndReportsFailure() throws {
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        XCTAssertFalse(saveConfig(.default, path: path))
+    }
+}
+
+// MARK: - Display Sleep Assertion
+
+final class DisplaySleepAssertionTests: XCTestCase {
+    private func ownAssertionTypes() -> [String] {
+        var byProcess: Unmanaged<CFDictionary>?
+        guard IOPMCopyAssertionsByProcess(&byProcess) == kIOReturnSuccess,
+              let all = byProcess?.takeRetainedValue() as? [NSNumber: [[String: Any]]] else { return [] }
+        return (all[NSNumber(value: getpid())] ?? []).compactMap { $0[kIOPMAssertionTypeKey] as? String }
+    }
+
+    private var holdsDisplayAssertion: Bool {
+        ownAssertionTypes().contains(kIOPMAssertionTypePreventUserIdleDisplaySleep)
+    }
+
+    func testActivateAndRelease() {
+        let assertion = DisplaySleepAssertion()
+        XCTAssertFalse(assertion.isActive)
+
+        assertion.setActive(true)
+        XCTAssertTrue(assertion.isActive)
+        XCTAssertTrue(holdsDisplayAssertion)
+
+        assertion.setActive(false)
+        XCTAssertFalse(assertion.isActive)
+        XCTAssertFalse(holdsDisplayAssertion)
+    }
+
+    func testRepeatedActivateHoldsSingleAssertion() {
+        let assertion = DisplaySleepAssertion()
+        assertion.setActive(true)
+        assertion.setActive(true)
+        XCTAssertEqual(ownAssertionTypes().filter { $0 == kIOPMAssertionTypePreventUserIdleDisplaySleep }.count, 1)
+        assertion.setActive(false)
+        XCTAssertFalse(holdsDisplayAssertion)
+    }
+
+    func testDeinitReleases() {
+        do {
+            let assertion = DisplaySleepAssertion()
+            assertion.setActive(true)
+            XCTAssertTrue(holdsDisplayAssertion)
+        }
+        XCTAssertFalse(holdsDisplayAssertion)
     }
 }
 
 // MARK: - Mode Decoding
 
 final class ModeTests: XCTestCase {
-    func testDecodesAuto() throws {
+    func testRemovedAutoModeDecodesAsOn() throws {
         let data = Data("\"auto\"".utf8)
         let mode = try JSONDecoder().decode(Mode.self, from: data)
-        XCTAssertEqual(mode, .auto)
+        XCTAssertEqual(mode, .on)
     }
 
     func testDecodesOn() throws {
@@ -292,18 +339,60 @@ final class ModeTests: XCTestCase {
         XCTAssertEqual(mode, .off)
     }
 
-    func testInvalidModeFallsBackToAuto() throws {
+    // Rejecting rather than absorbing is what lets `StayAwakeConfig` name the key in `malformedKeys`; the `.off`
+    // outcome an unreadable mode still produces is pinned by `ConfigTests` and `LoadConfigTests`.
+    func testInvalidModeIsRejected() {
         let data = Data("\"banana\"".utf8)
-        let mode = try JSONDecoder().decode(Mode.self, from: data)
-        XCTAssertEqual(mode, .auto)
+        XCTAssertThrowsError(try JSONDecoder().decode(Mode.self, from: data))
+    }
+
+    func testEmptyModeIsRejected() {
+        let data = Data("\"\"".utf8)
+        XCTAssertThrowsError(try JSONDecoder().decode(Mode.self, from: data))
     }
 
     func testModeRoundTrip() throws {
-        for mode in [Mode.auto, .on, .off] {
+        for mode in [Mode.on, .off] {
             let data = try JSONEncoder().encode(mode)
             let decoded = try JSONDecoder().decode(Mode.self, from: data)
             XCTAssertEqual(decoded, mode)
         }
+    }
+}
+
+// MARK: - Retry Unfinished Sleep Restore
+
+final class RetryUnfinishedSleepRestoreTests: XCTestCase {
+    func testNoRecordSkipsTheRetry() {
+        var attempted = false
+        let owed = retryUnfinishedSleepRestore(saved: nil) { _ in
+            attempted = true
+            return true
+        }
+        XCTAssertNil(owed)
+        XCTAssertFalse(attempted)
+    }
+
+    func testSuccessfulRetryOwesNothing() {
+        XCTAssertNil(retryUnfinishedSleepRestore(saved: 10) { _ in true })
+    }
+
+    func testFailedRetryStillOwesTheSavedValue() {
+        XCTAssertEqual(retryUnfinishedSleepRestore(saved: 10) { _ in false }, 10,
+                       "a retry that could not hand the setting back must not look like one that did")
+    }
+
+    func testRetryIsGivenTheClampedValue() {
+        var target: Int?
+        _ = retryUnfinishedSleepRestore(saved: 999) { value in
+            target = value
+            return true
+        }
+        XCTAssertEqual(target, 180)
+    }
+
+    func testFailedRetryOwesTheClampedValue() {
+        XCTAssertEqual(retryUnfinishedSleepRestore(saved: 0) { _ in false }, 1)
     }
 }
 
@@ -348,68 +437,6 @@ final class UsernameValidationTests: XCTestCase {
 
     func testSlashRejected() {
         XCTAssertFalse(isValidUsername("../etc"))
-    }
-}
-
-// MARK: - Sanitize For Display
-
-final class SanitizeForDisplayTests: XCTestCase {
-    func testNormalStringUnchanged() {
-        XCTAssertEqual(sanitizeForDisplay("node"), "node")
-    }
-
-    func testStripsControlCharacters() {
-        XCTAssertEqual(sanitizeForDisplay("no\u{0000}de"), "node")
-    }
-
-    func testStripsNullByte() {
-        XCTAssertEqual(sanitizeForDisplay("hel\u{0000}lo"), "hello")
-    }
-
-    func testStripsBidiOverrides() {
-        XCTAssertEqual(sanitizeForDisplay("node\u{202E}evil"), "nodeevil")
-    }
-
-    func testStripsRLO() {
-        XCTAssertEqual(sanitizeForDisplay("\u{202E}abc"), "abc")
-    }
-
-    func testStripsLRO() {
-        XCTAssertEqual(sanitizeForDisplay("\u{202D}test"), "test")
-    }
-
-    func testStripsZeroWidthChars() {
-        XCTAssertEqual(sanitizeForDisplay("a\u{200B}b\u{200C}c"), "abc")
-    }
-
-    func testStripsBidiIsolates() {
-        XCTAssertEqual(sanitizeForDisplay("\u{2066}text\u{2069}"), "text")
-    }
-
-    func testTruncatesLongStrings() {
-        let long = String(repeating: "a", count: 100)
-        let result = sanitizeForDisplay(long)
-        XCTAssertEqual(result.count, 51)
-        XCTAssertTrue(result.hasSuffix("…"))
-    }
-
-    func testExactly50CharsNotTruncated() {
-        let exact = String(repeating: "a", count: 50)
-        XCTAssertEqual(sanitizeForDisplay(exact), exact)
-    }
-
-    func test51CharsTruncated() {
-        let over = String(repeating: "b", count: 51)
-        let result = sanitizeForDisplay(over)
-        XCTAssertEqual(result, String(repeating: "b", count: 50) + "…")
-    }
-
-    func testEmptyStringUnchanged() {
-        XCTAssertEqual(sanitizeForDisplay(""), "")
-    }
-
-    func testMixedUnsafeChars() {
-        XCTAssertEqual(sanitizeForDisplay("\u{200E}no\u{202A}de\u{0007}"), "node")
     }
 }
 

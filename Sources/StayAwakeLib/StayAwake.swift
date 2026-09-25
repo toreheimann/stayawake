@@ -1,22 +1,12 @@
 import AppKit
+import IOKit.pwr_mgt
 import ServiceManagement
-import UserNotifications
 
 let PMSET = "/usr/bin/pmset"
 let CONFIG_PATH = NSString("~/.stayawake.json").expandingTildeInPath
 let MAX_CONFIG_SIZE: UInt64 = 1_048_576
-
-let DEFAULT_PROCESSES = [
-    "node", "npm", "pnpm", "yarn", "bun",
-    "python", "python3",
-    "docker", "docker-compose",
-    "ruby", "rails",
-    "go", "cargo",
-    "java",
-    "vite", "webpack", "next", "nuxt", "gatsby",
-    "postgres", "mysql", "redis", "mongod",
-    "claude",
-]
+let CLEANUP_FAILURE_REMEDY = "The Mac is still set not to sleep. Run `sudo pmset -a disablesleep 0` in Terminal, or launch StayAwake again to restore it."
+let RELAUNCH_RESTORE_FAILURE_REMEDY = "StayAwake couldn't confirm your sleep settings were restored after its last run. Run `sudo pmset -a disablesleep 0` in Terminal to make sure the Mac can sleep."
 
 var appVersion: String {
     Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -25,36 +15,68 @@ var appVersion: String {
 // MARK: - Mode
 
 enum Mode: String, Codable {
-    case auto, on, off
+    case on, off
 
+    /// The removed `auto` mode migrates to `.on`. Other unknown values throw, so the config decoder falls back safely.
     init(from decoder: Decoder) throws {
-        let raw = try decoder.singleValueContainer().decode(String.self)
-        self = Mode(rawValue: raw) ?? .auto
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        if raw == "auto" {
+            self = .on
+            return
+        }
+        guard let mode = Mode(rawValue: raw) else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "unrecognized mode \"\(raw)\"")
+        }
+        self = mode
     }
 }
 
 // MARK: - Config
 
 struct StayAwakeConfig: Codable {
-    var interval: Int
-    var mode: Mode
-    var processes: [String]
+    var mode: Mode = .on
+    var preventScreenLock = true
+    /// Keys present in the file but unreadable. Set by decoding, never encoded.
+    var malformedKeys: [String] = []
 
-    static let `default` = StayAwakeConfig(
-        interval: 10,
-        mode: .auto,
-        processes: DEFAULT_PROCESSES
-    )
+    enum CodingKeys: String, CodingKey {
+        case mode, preventScreenLock
+    }
+
+    static let `default` = StayAwakeConfig()
+
+    /// For values that exist but can't be read: an unreadable config must never turn anything on.
+    static let safeFallback = StayAwakeConfig(mode: .off, preventScreenLock: false)
 }
 
-func validateConfig(_ config: StayAwakeConfig) -> StayAwakeConfig {
-    var config = config
-    if config.interval < 1 || config.interval > 300 {
-        config.interval = StayAwakeConfig.default.interval
+extension StayAwakeConfig {
+    /// Decodes each key on its own: a missing key takes ``default``, an unreadable one takes ``safeFallback`` and is
+    /// listed in ``malformedKeys``.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        var malformed: [String] = []
+
+        if !container.contains(.mode) {
+            mode = Self.default.mode
+        } else if let decoded = try? container.decode(Mode.self, forKey: .mode) {
+            mode = decoded
+        } else {
+            mode = Self.safeFallback.mode
+            malformed.append(CodingKeys.mode.stringValue)
+        }
+
+        if !container.contains(.preventScreenLock) {
+            preventScreenLock = Self.default.preventScreenLock
+        } else if let decoded = try? container.decode(Bool.self, forKey: .preventScreenLock) {
+            preventScreenLock = decoded
+        } else {
+            preventScreenLock = Self.safeFallback.preventScreenLock
+            malformed.append(CodingKeys.preventScreenLock.stringValue)
+        }
+
+        malformedKeys = malformed
     }
-    config.processes = config.processes.filter { !$0.isEmpty }
-    if config.processes.isEmpty { config.processes = DEFAULT_PROCESSES }
-    return config
 }
 
 func isPathSafeToAccess(_ path: String) -> Bool {
@@ -63,32 +85,49 @@ func isPathSafeToAccess(_ path: String) -> Bool {
     return (statBuf.st_mode & S_IFMT) == S_IFREG
 }
 
-func loadConfig() -> StayAwakeConfig {
-    guard isPathSafeToAccess(CONFIG_PATH),
-          let attrs = try? FileManager.default.attributesOfItem(atPath: CONFIG_PATH),
-          let size = attrs[.size] as? UInt64,
-          size <= MAX_CONFIG_SIZE,
-          let data = try? Data(contentsOf: URL(fileURLWithPath: CONFIG_PATH)),
-          let config = try? JSONDecoder().decode(StayAwakeConfig.self, from: data) else {
-        return .default
+/// - Returns: the config, plus a reason when the file exists but was rejected or partly unreadable.
+func loadConfig(path: String = CONFIG_PATH) -> (config: StayAwakeConfig, rejectionReason: String?) {
+    var statBuf = stat()
+    guard lstat(path, &statBuf) == 0 else { return (.default, nil) }
+
+    guard isPathSafeToAccess(path) else {
+        return (.safeFallback, "\(path) is not a regular file")
     }
-    return validateConfig(config)
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          let size = attrs[.size] as? UInt64, size <= MAX_CONFIG_SIZE else {
+        return (.safeFallback, "\(path) is unreadable or larger than \(MAX_CONFIG_SIZE) bytes")
+    }
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+        return (.safeFallback, "\(path) could not be read")
+    }
+    do {
+        let config = try JSONDecoder().decode(StayAwakeConfig.self, from: data)
+        guard config.malformedKeys.isEmpty else {
+            return (config, "\(path) has unreadable values for: \(config.malformedKeys.joined(separator: ", "))")
+        }
+        return (config, nil)
+    } catch {
+        return (.safeFallback, "\(path) is not valid StayAwake JSON: \(error.localizedDescription)")
+    }
 }
 
-func saveConfig(_ config: StayAwakeConfig) {
+/// - Returns: whether the settings reached disk.
+func saveConfig(_ config: StayAwakeConfig, path: String = CONFIG_PATH) -> Bool {
     var statBuf = stat()
-    if lstat(CONFIG_PATH, &statBuf) == 0 {
-        guard (statBuf.st_mode & S_IFMT) == S_IFREG else { return }
+    if lstat(path, &statBuf) == 0 {
+        guard (statBuf.st_mode & S_IFMT) == S_IFREG else { return false }
     }
 
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    guard let data = try? encoder.encode(config) else { return }
+    guard let data = try? encoder.encode(config) else { return false }
     do {
-        try data.write(to: URL(fileURLWithPath: CONFIG_PATH), options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: CONFIG_PATH)
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        return true
     } catch {
         fputs("Warning: could not save config\n", stderr)
+        return false
     }
 }
 
@@ -104,76 +143,50 @@ func migrateConfigIfNeeded() {
     try? cleanData.write(to: URL(fileURLWithPath: CONFIG_PATH), options: .atomic)
 }
 
-// MARK: - Process Monitor
+// MARK: - Display Sleep Assertion
 
-func parseProcessList(_ output: String, excludingPid: Int32) -> Set<String> {
-    var procs = Set<String>()
-    for line in output.split(separator: "\n") {
-        let parts = line.trimmingCharacters(in: .whitespaces)
-            .split(maxSplits: 1, omittingEmptySubsequences: true) { $0.isWhitespace }
-        guard parts.count == 2, let pid = Int32(parts[0]), pid != excludingPid else { continue }
-        let name = String(parts[1]).split(separator: "/").last.map(String.init) ?? String(parts[1])
-        procs.insert(name.trimmingCharacters(in: .whitespaces).lowercased())
-    }
-    return procs
-}
+/// Holds a `PreventUserIdleDisplaySleep` power assertion while active.
+final class DisplaySleepAssertion {
+    private var id = IOPMAssertionID(kIOPMNullAssertionID)
 
-func getRunningProcesses() -> Set<String> {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/bin/ps")
-    task.arguments = ["axo", "pid,comm"]
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = FileHandle.nullDevice
+    var isActive: Bool { id != IOPMAssertionID(kIOPMNullAssertionID) }
 
-    guard (try? task.run()) != nil else { return [] }
-
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    task.waitUntilExit()
-
-    guard let output = String(data: data, encoding: .utf8) else { return [] }
-    return parseProcessList(output, excludingPid: ProcessInfo.processInfo.processIdentifier)
-}
-
-func processNameMatches(_ processName: String, key: String) -> Bool {
-    guard processName.hasPrefix(key) else { return false }
-    if processName.count == key.count { return true }
-    let nextChar = processName[processName.index(processName.startIndex, offsetBy: key.count)]
-    return !nextChar.isLetter
-}
-
-func findMatches(watched: [String], running: Set<String>) -> [String] {
-    var seen = Set<String>()
-    var result = [String]()
-    for p in watched {
-        let key = p.lowercased()
-        guard !seen.contains(key) else { continue }
-        if running.contains(where: { processNameMatches($0, key: key) }) {
-            seen.insert(key)
-            result.append(p)
+    func setActive(_ active: Bool) {
+        guard active != isActive else { return }
+        if !active {
+            IOPMAssertionRelease(id)
+            id = IOPMAssertionID(kIOPMNullAssertionID)
+            return
+        }
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "StayAwake is preventing idle display sleep and screen lock" as CFString,
+            &id
+        )
+        if result != kIOReturnSuccess {
+            id = IOPMAssertionID(kIOPMNullAssertionID)
+            fputs("Warning: could not create display sleep assertion (\(result))\n", stderr)
         }
     }
-    return result
-}
 
-let unsafeDisplayScalars: CharacterSet = {
-    var set = CharacterSet.controlCharacters
-    set.insert(charactersIn: "\u{200B}\u{200C}\u{200D}\u{200E}\u{200F}")
-    set.insert(charactersIn: "\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}")
-    set.insert(charactersIn: "\u{2066}\u{2067}\u{2068}\u{2069}")
-    return set
-}()
-
-func sanitizeForDisplay(_ name: String) -> String {
-    let cleaned = name.unicodeScalars.filter { !unsafeDisplayScalars.contains($0) }
-    let result = String(String.UnicodeScalarView(cleaned))
-    return result.count > 50 ? String(result.prefix(50)) + "…" : result
+    deinit { setActive(false) }
 }
 
 // MARK: - Sleep Controller
 
 func clampSleepValue(_ value: Int) -> Int {
     max(1, min(value, 180))
+}
+
+/// Retries a sleep restore that a previous run left unfinished.
+///
+/// - Returns: the value still owed, or `nil` if nothing was owed or the retry worked. While it's non-nil, the Mac's
+///   current sleep value is this app's own and must not be recorded as the original.
+func retryUnfinishedSleepRestore(saved: Int?, restore: (Int) -> Bool) -> Int? {
+    guard let saved else { return nil }
+    let target = clampSleepValue(saved)
+    return restore(target) ? nil : target
 }
 
 @discardableResult
@@ -262,27 +275,26 @@ private func runProcess(_ path: String, args: [String]) -> Bool {
 
 // MARK: - App Delegate
 
-public class AppDelegate: NSObject, NSApplicationDelegate {
+public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var activeItem: NSMenuItem!
-    private var modeAutoItem: NSMenuItem!
-    private var modeOnItem: NSMenuItem!
-    private var modeOffItem: NSMenuItem!
+    private var keepAwakeItem: NSMenuItem!
+    private var preventLockItem: NSMenuItem!
+    private var launchAtLoginItem: NSMenuItem!
 
     private var config: StayAwakeConfig!
+    /// What the toggle asks for; `awake` lags it until pmset succeeds.
+    private var wantsAwake = false
     private var awake = false
+    private var sleepChangeInFlight = false
     private var originalSleep: Int = 1
-    private var pollTimer: Timer?
+    private let displayAssertion = DisplaySleepAssertion()
 
     private var iconActive: NSImage?
     private var iconInactive: NSImage?
     private var signalSources: [DispatchSourceSignal] = []
 
-    private var settingsPanel: NSPanel?
-    private var settingsIntervalField: NSTextField?
-    private var settingsTextView: NSTextView?
-    private var settingsLoginCheck: NSButton?
-
+    /// Serial, so `cleanup`'s disable is ordered after any pmset call already in flight instead of racing it.
+    private let sleepQueue = DispatchQueue(label: "com.signifly.stayawake.sleep")
     private let cleanupQueue = DispatchQueue(label: "com.signifly.stayawake.cleanup")
     private var _cleanedUp = false
 
@@ -292,25 +304,42 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
-
         loadIcons()
         migrateConfigIfNeeded()
-        config = loadConfig()
+        let load = loadConfig()
+        config = load.config
 
-        if let saved = UserDefaults.standard.object(forKey: "originalSleep") as? Int {
-            setSleepPrevention(enabled: false, restoreSleep: clampSleepValue(saved))
-            UserDefaults.standard.removeObject(forKey: "originalSleep")
-        }
-
-        originalSleep = getSleepValue() ?? 1
+        let savedSleep = UserDefaults.standard.object(forKey: "originalSleep") as? Int
+        // Read once, before this run can touch pmset. A restore retry either returns the Mac to the saved value or
+        // still owes it, so the saved value stays the original either way.
+        originalSleep = savedSleep.map(clampSleepValue) ?? getSleepValue() ?? 1
         UserDefaults.standard.set(originalSleep, forKey: "originalSleep")
 
+        // Icon now, so the launch is visible behind the permission prompt. The menu waits until the retry has run,
+        // so nothing can toggle sleep before then.
         setupStatusBar()
-        setupMenu()
 
+        // Before the restore retry: it runs pmset through the sudoers rule this may install.
         if !checkSudoers() {
             requestPermissions()
+        }
+
+        let stillOwed = retryUnfinishedSleepRestore(saved: savedSleep) {
+            setSleepPrevention(enabled: false, restoreSleep: $0)
+        }
+
+        setupMenu()
+
+        if let reason = load.rejectionReason {
+            let remedy = isPathSafeToAccess(CONFIG_PATH)
+                ? "Changing a setting from the menu rewrites the file."
+                : "StayAwake will not write through a symlink or directory — move or delete \(CONFIG_PATH) to use the menu's settings."
+            let state = config.mode == .on ? "Keep Awake stays on." : "Starting with Keep Awake off."
+            showFailureAlert("StayAwake could not read its settings", "\(reason)\n\n\(state) \(remedy)")
+        }
+
+        if stillOwed != nil {
+            showFailureAlert("StayAwake could not restore sleep settings", RELAUNCH_RESTORE_FAILURE_REMEDY)
         }
 
         for sig in [SIGTERM, SIGINT] {
@@ -324,7 +353,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             signalSources.append(source)
         }
 
-        applyMode(startTimer: true)
+        requestAwake(config.mode == .on)
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
@@ -365,34 +394,21 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupMenu() {
         let menu = NSMenu()
+        menu.delegate = self
 
-        activeItem = NSMenuItem(title: "No watched processes running", action: nil, keyEquivalent: "")
-        activeItem.isEnabled = false
-        menu.addItem(activeItem)
+        keepAwakeItem = NSMenuItem(title: "Keep Awake", action: #selector(onToggleKeepAwake), keyEquivalent: "")
+        keepAwakeItem.target = self
+        menu.addItem(keepAwakeItem)
 
-        let separatorAfterStatus = NSMenuItem.separator()
-        separatorAfterStatus.tag = 999
-        menu.addItem(separatorAfterStatus)
+        preventLockItem = NSMenuItem(title: "Prevent Screen Lock", action: #selector(onTogglePreventScreenLock), keyEquivalent: "")
+        preventLockItem.target = self
+        preventLockItem.toolTip = "While awake, keep the display on so the Mac doesn't idle into the lock screen."
+        menu.addItem(preventLockItem)
+        menu.addItem(.separator())
 
-        let modeMenu = NSMenu()
-        modeAutoItem = NSMenuItem(title: "Auto", action: #selector(onModeAuto), keyEquivalent: "")
-        modeAutoItem.target = self
-        modeOnItem = NSMenuItem(title: "Always On", action: #selector(onModeOn), keyEquivalent: "")
-        modeOnItem.target = self
-        modeOffItem = NSMenuItem(title: "Always Off", action: #selector(onModeOff), keyEquivalent: "")
-        modeOffItem.target = self
-        modeMenu.addItem(modeAutoItem)
-        modeMenu.addItem(modeOnItem)
-        modeMenu.addItem(modeOffItem)
-
-        let modeItem = NSMenuItem(title: "Mode", action: nil, keyEquivalent: "")
-        modeItem.image = NSImage(systemSymbolName: "switch.2", accessibilityDescription: "Mode")
-        modeItem.submenu = modeMenu
-        menu.addItem(modeItem)
-
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
-        settingsItem.target = self
-        menu.addItem(settingsItem)
+        launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(onToggleLaunchAtLogin), keyEquivalent: "")
+        launchAtLoginItem.target = self
+        menu.addItem(launchAtLoginItem)
         menu.addItem(.separator())
 
         let versionItem = NSMenuItem(title: "StayAwake v\(appVersion)", action: nil, keyEquivalent: "")
@@ -404,124 +420,131 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
-        updateModeMenu()
+        updateMenuState()
     }
 
-    // MARK: Mode
-
-    private func updateModeMenu() {
-        modeAutoItem.state = config.mode == .auto ? .on : .off
-        modeOnItem.state = config.mode == .on ? .on : .off
-        modeOffItem.state = config.mode == .off ? .on : .off
+    public func menuWillOpen(_ menu: NSMenu) {
+        updateMenuState()
     }
 
-    @objc private func onModeAuto() { changeMode(.auto) }
-    @objc private func onModeOn() { changeMode(.on) }
-    @objc private func onModeOff() { changeMode(.off) }
-
-    private func changeMode(_ mode: Mode) {
-        config.mode = mode
-        saveConfig(config)
-        updateModeMenu()
-        applyMode(startTimer: true)
+    private func updateMenuState() {
+        // `wantsAwake`, not `config.mode`, so a change pmset refused shows as not applied.
+        keepAwakeItem.state = wantsAwake ? .on : .off
+        preventLockItem.state = config.preventScreenLock ? .on : .off
+        launchAtLoginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
-    private func applyMode(startTimer: Bool) {
-        pollTimer?.invalidate()
-        pollTimer = nil
+    @objc private func onToggleKeepAwake() {
+        // Toggles the displayed state, so after a failed change a click retries it.
+        let wanted = !wantsAwake
+        config.mode = wanted ? .on : .off
+        persistConfig()
+        requestAwake(wanted)
+    }
 
-        switch config.mode {
-        case .on:
-            if !awake { setAwake(true) }
-            activeItem.title = "Always On"
-            statusItem.button?.setAccessibilityTitle("StayAwake — always on")
-        case .off:
-            if awake { setAwake(false) }
-            activeItem.title = "Always Off"
-            statusItem.button?.setAccessibilityTitle("StayAwake — always off")
-        case .auto:
-            if startTimer {
-                pollTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(config.interval), repeats: true) { [weak self] _ in
-                    self?.poll()
-                }
-                poll()
+    @objc private func onTogglePreventScreenLock() {
+        config.preventScreenLock.toggle()
+        persistConfig()
+        updateMenuState()
+        updateDisplayAssertion()
+    }
+
+    private func persistConfig() {
+        guard !saveConfig(config) else { return }
+        showFailureAlert(
+            "StayAwake could not save its settings",
+            "\(CONFIG_PATH) could not be written. The change applies now but will not survive a restart."
+        )
+    }
+
+    @objc private func onToggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        let wasEnabled = service.status == .enabled
+        do {
+            if wasEnabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            // Pending approval isn't a failure; System Settings takes over below.
+            if service.status != .requiresApproval {
+                showFailureAlert(
+                    wasEnabled ? "Could not turn off Launch at Login" : "Could not turn on Launch at Login",
+                    error.localizedDescription
+                )
             }
         }
-    }
-
-    // MARK: Polling
-
-    private func poll() {
-        let processes = config.processes
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let running = getRunningProcesses()
-            let matches = findMatches(watched: processes, running: running)
-            let shouldBeAwake = !matches.isEmpty
-
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if shouldBeAwake != self.awake {
-                    self.setAwake(shouldBeAwake)
-                }
-                self.updateStatusDisplay(matches: matches)
-            }
+        if service.status == .requiresApproval {
+            SMAppService.openSystemSettingsLoginItems()
         }
-    }
-
-    private static let extraItemTag = 100
-
-    private func updateStatusDisplay(matches: [String]) {
-        guard let menu = statusItem.menu else { return }
-
-        while let item = menu.item(withTag: Self.extraItemTag) {
-            menu.removeItem(item)
-        }
-
-        if matches.isEmpty {
-            activeItem.title = "No watched processes running"
-            statusItem.button?.setAccessibilityTitle("StayAwake — idle")
-            return
-        }
-
-        activeItem.title = "Active:"
-        statusItem.button?.setAccessibilityTitle("StayAwake — preventing sleep")
-
-        let insertIndex = menu.index(of: activeItem) + 1
-        for (i, name) in matches.enumerated() {
-            let item = NSMenuItem(title: sanitizeForDisplay(name), action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            item.tag = Self.extraItemTag
-            menu.insertItem(item, at: insertIndex + i)
-        }
+        updateMenuState()
     }
 
     // MARK: Sleep Control
 
-    private func setAwake(_ awake: Bool) {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+    /// Follows `awake`, not `wantsAwake`, so a sleep change pmset rejected never keeps the screen unlocked.
+    private func updateDisplayAssertion() {
+        displayAssertion.setActive(awake && config.preventScreenLock)
+    }
+
+    private func requestAwake(_ wanted: Bool) {
+        wantsAwake = wanted
+        updateMenuState()
+        // One pmset change at a time; on success the handler catches up to the latest `wantsAwake`.
+        // A failure rolls back instead of retrying.
+        guard wanted != awake, !sleepChangeInFlight else { return }
+        sleepChangeInFlight = true
+
+        sleepQueue.async { [weak self] in
             guard let self, !self.cleanedUp else { return }
-            let ok = setSleepPrevention(enabled: awake, restoreSleep: self.originalSleep)
+            let ok = setSleepPrevention(enabled: wanted, restoreSleep: self.originalSleep)
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.cleanedUp else { return }
-                if !ok {
-                    let content = UNMutableNotificationContent()
-                    content.title = "StayAwake"
-                    content.subtitle = "Sleep control failed"
-                    content.body = "Could not change sleep settings. Check permissions."
-                    let request = UNNotificationRequest(identifier: "sleep-failed", content: content, trigger: nil)
-                    UNUserNotificationCenter.current().add(request)
+                self.sleepChangeInFlight = false
+                guard ok else {
+                    self.rollBackFailedSleepChange()
                     return
                 }
-                self.awake = awake
-                self.statusItem.button?.image = awake ? self.iconActive : self.iconInactive
-                self.statusItem.button?.setAccessibilityTitle(awake ? "StayAwake — preventing sleep" : "StayAwake — idle")
+                self.awake = wanted
+                self.updateDisplayAssertion()
+                self.statusItem.button?.image = wanted ? self.iconActive : self.iconInactive
+                self.statusItem.button?.setAccessibilityTitle(wanted ? "StayAwake — preventing sleep" : "StayAwake — idle")
+                if self.wantsAwake != wanted {
+                    self.requestAwake(self.wantsAwake)
+                }
             }
         }
+    }
+
+    /// pmset refused the change: return intent, assertion and menu to the applied state. `config` keeps the user's
+    /// choice, so a transient permission failure doesn't overwrite it on disk.
+    private func rollBackFailedSleepChange() {
+        wantsAwake = awake
+        updateDisplayAssertion()
+        updateMenuState()
+        showFailureAlert(
+            "StayAwake could not change sleep settings",
+            "Check that StayAwake still has permission to run pmset."
+        )
+    }
+
+    // MARK: Alerts
+
+    /// Activates first: an accessory app's modal otherwise opens behind the frontmost app's windows.
+    private func showFailureAlert(_ messageText: String, _ informativeText: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = messageText
+        alert.informativeText = informativeText
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 
     // MARK: Permissions
 
     private func requestPermissions() {
+        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "StayAwake needs permission"
         alert.informativeText = "One-time admin access is needed to control sleep without a password prompt each time. Click Grant Access to proceed."
@@ -531,168 +554,45 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
         if alert.runModal() == .alertFirstButtonReturn {
             if setupSudoers() {
+                NSApp.activate(ignoringOtherApps: true)
                 let ok = NSAlert()
                 ok.messageText = "Permission granted!"
                 ok.informativeText = "StayAwake is ready."
                 ok.runModal()
             } else {
-                let fail = NSAlert()
-                fail.messageText = "Permission not granted"
-                fail.informativeText = "StayAwake cannot control sleep without this permission."
-                fail.alertStyle = .warning
-                fail.runModal()
+                showFailureAlert("Permission not granted", "StayAwake cannot control sleep without this permission.")
             }
         }
-    }
-
-    // MARK: Settings
-
-    @objc private func openSettings() {
-        if let panel = settingsPanel {
-            panel.makeKeyAndOrderFront(nil)
-            if #available(macOS 14, *) {
-                NSApp.activate()
-            } else {
-                NSApp.activate(ignoringOtherApps: true)
-            }
-            return
-        }
-
-        let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 300),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        panel.title = "StayAwake Settings"
-        panel.isFloatingPanel = true
-        panel.level = .floating
-
-        let contentView = NSView(frame: panel.contentRect(forFrameRect: panel.frame))
-
-        let intervalLabel = NSTextField(labelWithString: "Check interval (seconds):")
-        intervalLabel.frame = NSRect(x: 20, y: 255, width: 200, height: 20)
-        contentView.addSubview(intervalLabel)
-
-        let intervalField = NSTextField(frame: NSRect(x: 20, y: 230, width: 100, height: 24))
-        intervalField.stringValue = String(config.interval)
-        contentView.addSubview(intervalField)
-
-        let processLabel = NSTextField(labelWithString: "Watched processes (comma-separated):")
-        processLabel.frame = NSRect(x: 20, y: 200, width: 380, height: 20)
-        contentView.addSubview(processLabel)
-
-        let scrollView = NSScrollView(frame: NSRect(x: 20, y: 90, width: 380, height: 105))
-        let textView = NSTextView(frame: scrollView.contentView.bounds)
-        textView.isEditable = true
-        textView.isRichText = false
-        textView.font = .systemFont(ofSize: 13)
-        textView.string = config.processes.joined(separator: ", ")
-        textView.autoresizingMask = [.width, .height]
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.borderType = .bezelBorder
-        contentView.addSubview(scrollView)
-
-        let loginCheck = NSButton(checkboxWithTitle: "Launch at Login", target: nil, action: nil)
-        loginCheck.frame = NSRect(x: 20, y: 55, width: 200, height: 20)
-        loginCheck.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        contentView.addSubview(loginCheck)
-
-        let saveButton = NSButton(title: "Save", target: nil, action: nil)
-        saveButton.frame = NSRect(x: 310, y: 15, width: 90, height: 30)
-        saveButton.bezelStyle = .rounded
-        saveButton.keyEquivalent = "\r"
-        contentView.addSubview(saveButton)
-
-        let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
-        cancelButton.frame = NSRect(x: 210, y: 15, width: 90, height: 30)
-        cancelButton.bezelStyle = .rounded
-        cancelButton.keyEquivalent = "\u{1b}"
-        contentView.addSubview(cancelButton)
-
-        panel.contentView = contentView
-        panel.center()
-
-        saveButton.target = self
-        saveButton.action = #selector(settingsSave(_:))
-        cancelButton.target = self
-        cancelButton.action = #selector(settingsCancel(_:))
-
-        settingsPanel = panel
-        settingsIntervalField = intervalField
-        settingsTextView = textView
-        settingsLoginCheck = loginCheck
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(settingsPanelClosed(_:)),
-            name: NSWindow.willCloseNotification,
-            object: panel
-        )
-
-        panel.makeKeyAndOrderFront(nil)
-        if #available(macOS 14, *) {
-            NSApp.activate()
-        } else {
-            NSApp.activate(ignoringOtherApps: true)
-        }
-    }
-
-    @objc private func settingsSave(_ sender: NSButton) {
-        guard let intervalField = settingsIntervalField,
-              let textView = settingsTextView,
-              let loginCheck = settingsLoginCheck else { return }
-
-        let interval = max(1, Int(intervalField.stringValue) ?? config.interval)
-        let processes = textView.string.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-
-        config.interval = interval
-        config.processes = processes
-        saveConfig(config)
-
-        let wantLogin = loginCheck.state == .on
-        let currentlyEnabled = SMAppService.mainApp.status == .enabled
-        if wantLogin && !currentlyEnabled {
-            try? SMAppService.mainApp.register()
-        } else if !wantLogin && currentlyEnabled {
-            try? SMAppService.mainApp.unregister()
-        }
-
-        applyMode(startTimer: true)
-        settingsPanel?.close()
-    }
-
-    @objc private func settingsCancel(_ sender: NSButton) {
-        settingsPanel?.close()
-    }
-
-    @objc private func settingsPanelClosed(_ notification: Notification) {
-        guard (notification.object as? NSPanel) === settingsPanel else { return }
-        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: settingsPanel)
-        settingsPanel = nil
-        settingsIntervalField = nil
-        settingsTextView = nil
-        settingsLoginCheck = nil
     }
 
     // MARK: Cleanup
 
-    private func cleanup() {
+    /// - Returns: whether the Mac got its sleep settings back. `false` leaves `originalSleep` in place so the next
+    ///   launch retries. Repeat calls return `true`.
+    @discardableResult
+    private func cleanup() -> Bool {
         let shouldRun = cleanupQueue.sync { () -> Bool in
             if _cleanedUp { return false }
             _cleanedUp = true
             return true
         }
-        guard shouldRun else { return }
-        let ok = setSleepPrevention(enabled: false, restoreSleep: originalSleep)
+        guard shouldRun else { return true }
+        displayAssertion.setActive(false)
+        // Via `sleepQueue`, so an in-flight enable finishes before this disable instead of landing after it.
+        let restore = originalSleep
+        let ok = sleepQueue.sync { setSleepPrevention(enabled: false, restoreSleep: restore) }
         if ok {
             UserDefaults.standard.removeObject(forKey: "originalSleep")
+        } else {
+            fputs("Warning: could not restore sleep settings on exit\n", stderr)
         }
+        return ok
     }
 
     @objc private func quitApp() {
-        cleanup()
+        if !cleanup() {
+            showFailureAlert("StayAwake could not restore sleep settings", CLEANUP_FAILURE_REMEDY)
+        }
         NSApp.terminate(nil)
     }
 }
