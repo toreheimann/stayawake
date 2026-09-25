@@ -309,6 +309,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let load = loadConfig()
         config = load.config
 
+        let savedSleep = UserDefaults.standard.object(forKey: "originalSleep") as? Int
+        // Provisional until the retry below, so a quit during the permission prompt restores the recorded value
+        // rather than a placeholder.
+        originalSleep = savedSleep.map(clampSleepValue) ?? getSleepValue() ?? 1
+
         setupStatusBar()
         setupMenu()
 
@@ -317,7 +322,6 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             requestPermissions()
         }
 
-        let savedSleep = UserDefaults.standard.object(forKey: "originalSleep") as? Int
         let stillOwed = retryUnfinishedSleepRestore(saved: savedSleep) {
             setSleepPrevention(enabled: false, restoreSleep: $0)
         }
@@ -550,16 +554,13 @@ public class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if alert.runModal() == .alertFirstButtonReturn {
             if setupSudoers() {
+                NSApp.activate(ignoringOtherApps: true)
                 let ok = NSAlert()
                 ok.messageText = "Permission granted!"
                 ok.informativeText = "StayAwake is ready."
                 ok.runModal()
             } else {
-                let fail = NSAlert()
-                fail.messageText = "Permission not granted"
-                fail.informativeText = "StayAwake cannot control sleep without this permission."
-                fail.alertStyle = .warning
-                fail.runModal()
+                showFailureAlert("Permission not granted", "StayAwake cannot control sleep without this permission.")
             }
         }
     }
